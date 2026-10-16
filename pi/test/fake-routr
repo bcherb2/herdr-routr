@@ -1,0 +1,442 @@
+#!/usr/bin/env node
+// A stand-in for the routr CLI, for the live smoke test (test/smoke.zsh).
+//
+// Serves the skills/routr/cli.md surface the Pi extension uses, from a small state
+// file, with workers that move through their states on a clock:
+//   start      → a new worker (id from 7): starting, then running for
+//                FAKE_ROUTR_RUN_SECS (default 20) while a Claude-format
+//                transcript grows, then done (verdict fail, REDTEAM.md).
+//                Like the CLI it says "routr: queued worker ID …" on stderr
+//                and records the caller's PI_SESSION_ID
+//   flow start → chain demo-N, for the steps view: plan, review (pass), a
+//                foreach implement step (worker + 3 copies, 2 at once), and
+//                merge at a gate, each step FAKE_ROUTR_RUN_SECS long
+//   ask [ID] [--menu bash|write|none] [--screen-only]
+//              → blocks worker ID (default: the newest running one) on
+//                Claude's permission prompt for a Bash call (bash, the
+//                default) or a Write (write), or on a question with no menu
+//                (none), as routr reports it: the question and its numbered
+//                options joined by \n (internal/worker/screen.go), the
+//                options, a fingerprint and the call it is about (pending).
+//                On a blocked worker it is another question. --screen-only
+//                changes only what its screen shows, not the registry: the
+//                watcher has not seen it yet.
+//                answer ID N [--expect FP] [--by WHO] lets it go on: an FP
+//                that is not the screen's exits 4 (no menu there: 1), --by
+//                agent or jev without --expect exits 2, and option 2 (it
+//                lasts past this call) by agent or jev exits 1, as the CLI does
+//   show ID --context --json → what its question is decided with: the brief
+//                and SPEC.md as paths, option 2 as lasting; it takes
+//                FAKE_ROUTR_SLOW_CONTEXT_MS to answer, when set
+//   show ID [--focus] → "ok: show ID"
+//   version --json → the revision in FAKE_ROUTR_REV ("old": a routr without
+//                the version command, which exits 2)
+//   start and flow start take --answer human|agent|jev (default human),
+//                recorded on each worker as answerer
+//   cancel ID|CHAIN → like the CLI: says "routr: cancelled ID …" per worker it
+//                hits, but a finished one stays done (it only loses its pane)
+//   send ID TEXT → a follow-up: the worker's turn goes up and it runs again
+//                for FAKE_ROUTR_RUN_SECS, then is done again with a reply
+//   list [--all] --json (active + changed within the last hour, as skills/routr/cli.md),
+//   result, wait, answer, approve, show, hide, close
+// Seeded workers (smoke.zsh): 2 finished long ago, 3 another session's,
+// running forever. Neither may wake the model.
+//
+// State: $ROUTR_STATE_DIR (the .routr dir), default ./.routr. Every call is
+// appended to fake-calls.log there.
+
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
+const dir = process.env.ROUTR_STATE_DIR || join(process.cwd(), ".routr");
+const runSecs = Number(process.env.FAKE_ROUTR_RUN_SECS || 20);
+const stateFile = join(dir, "fake.json");
+const sigFile = join(dir, "fake-registry.sig");
+const registry = join(dir, "state", "registry.json");
+mkdirSync(join(dir, "state"), { recursive: true });
+appendFileSync(join(dir, "fake-calls.log"), `${new Date().toISOString()} ${process.argv.slice(2).join(" ")}\n`);
+
+const load = () => (existsSync(stateFile) ? JSON.parse(readFileSync(stateFile, "utf8")) : { nextId: 7, workers: {} });
+const save = (s) => writeFileSync(stateFile, JSON.stringify(s, null, 2));
+const iso = (ms) => new Date(ms).toISOString();
+const ZERO = "0001-01-01T00:00:00Z";
+
+const TOOLS = [
+	["Read", { file_path: "PLAN.md" }],
+	["Grep", { pattern: "token", path: "src" }],
+	["Bash", { command: "go test ./internal/auth/..." }],
+	["Read", { file_path: "internal/auth/store.go" }],
+	["Write", { file_path: "REDTEAM.md" }],
+];
+
+function transcriptPath(id) {
+	return join(dir, "runs", String(id), "transcript.jsonl");
+}
+
+// Grow the transcript to match the worker's age: one tool call per 3 s.
+function growTranscript(id, w, now) {
+	const p = transcriptPath(id);
+	mkdirSync(join(dir, "runs", String(id)), { recursive: true });
+	const want = Math.min(TOOLS.length, Math.floor((now - w.startedAt) / 3000));
+	const have = existsSync(p) ? readFileSync(p, "utf8").split("\n").filter(Boolean).length : 0;
+	for (let i = have; i < want; i++) {
+		const [name, input] = TOOLS[i];
+		// each harness's own transcript format (internal/transcript/transcript.go)
+		const rec =
+			w.harness === "codex"
+				? { type: "response_item", payload: { type: "function_call", name, arguments: JSON.stringify(input) } }
+				: { type: "assistant", message: { model: w.model, content: [{ type: "tool_use", name, input }] } };
+		appendFileSync(p, JSON.stringify(rec) + "\n");
+	}
+}
+
+const secs = (w) => w.runSecs ?? runSecs;
+
+function stateOf(w, now) {
+	if (w.cancelled) return "cancelled";
+	if (w.fixed) return w.fixed;
+	if (w.blockedAt) return "blocked";
+	if (w.resumedAt !== undefined) return now - w.resumedAt < secs(w) * 1000 ? "running" : "done";
+	const age = (now - w.startedAt) / 1000;
+	if (age < 0) return "waiting";
+	if (w.fanout) return "waiting"; // an expanded foreach worker waits on its copies; the chain view skips it
+	if (age < 2) return "starting";
+	if (age < secs(w)) return "running";
+	return "done";
+}
+
+function record(id, w, now) {
+	const state = stateOf(w, now);
+	const done = state === "done";
+	const queued = state === "waiting" || state === "pending" || state === "gated";
+	if (!w.fixed && !queued && state !== "starting") growTranscript(id, w, Math.min(now, w.startedAt + secs(w) * 1000));
+	return {
+		id: Number(id),
+		chain: w.chain,
+		step: w.step,
+		gate: w.gate,
+		fanout: w.fanout && now < w.startedAt ? { glob: w.fanout.glob, max_items: w.fanout.max_items } : w.fanout, // copies appear when it expands
+		parallel: w.parallel,
+		role: w.role,
+		harness: w.harness,
+		model: w.model,
+		effort: w.effort,
+		permissions: "auto",
+		answerer: w.answerer ?? "human",
+		cwd: process.cwd(),
+		write: false,
+		brief: w.brief,
+		output: w.output,
+		state,
+		question: state === "blocked" ? asked(w).question : undefined,
+		options: state === "blocked" ? asked(w).options : undefined,
+		fingerprint: state === "blocked" ? asked(w).fingerprint : undefined,
+		pending: state === "blocked" ? asked(w).pending : undefined,
+		answer: w.answer,
+		turn: w.turn,
+		replies: w.turn === undefined ? undefined : state === "done" ? w.turn : w.turn - 1,
+		answered_by: w.answeredBy,
+		verdict: done ? (w.verdict ?? "fail") : undefined,
+		transcript: w.fixed || queued ? undefined : transcriptPath(id),
+		created: iso(w.createdAt ?? w.startedAt - 500),
+		updated: iso(done ? w.startedAt + secs(w) * 1000 : w.blockedAt ?? now),
+		started: queued ? ZERO : iso(w.startedAt),
+		finished: done ? iso(w.startedAt + secs(w) * 1000) : w.fixed === "done" ? iso(w.startedAt + 60_000) : ZERO,
+		run_dir: join(dir, "runs", String(id)),
+		...(w.caller ? { caller: w.caller } : {}),
+	};
+}
+
+// Touch the registry only when some state or question changed, like the real
+// watcher. list runs on every poll, beside ask and answer, so it never writes
+// fake.json: a poll that overlapped them would put back what they changed.
+function list(s, now) {
+	const recs = Object.entries(s.workers).map(([id, w]) => record(id, w, now));
+	const sig = recs.map((r) => `${r.id}:${r.state}:${r.fingerprint ?? r.question ?? ""}`).join(",");
+	if (sig !== (existsSync(sigFile) ? readFileSync(sigFile, "utf8") : "")) {
+		writeFileSync(sigFile, sig);
+		writeFileSync(registry, JSON.stringify({ version: 1, workers: recs }));
+	}
+	return recs;
+}
+
+function flag(args, name, dflt) {
+	const i = args.indexOf(name);
+	return i >= 0 ? args[i + 1] : dflt;
+}
+
+// Claude Code's permission prompt for a Bash call, as question() reads it off the screen.
+const OPTIONS = [
+	"Yes",
+	"Yes, and don't ask again for: xargs -I {} sh -c 'echo \"═══ {} ═══\" && cat {}'",
+	"No, and tell Claude what to do differently (esc)",
+];
+const numbered = (q, options) => [q, ...options.map((o, i) => `${i + 1}. ${o}`)].join("\n");
+// The tool call it is about, as the watcher records it (`pending`).
+const COMMAND = `ls *.md | xargs -I {} sh -c 'echo "═══ {} ═══" && cat {}'`;
+const NOTES = join(process.cwd(), "notes.md");
+const WRITE_OPTIONS = ["Yes", "Yes, allow all edits during this session (shift+tab)", "No"];
+// lasting: options only the user may pick (internal/menu, Lasting)
+const MENUS = {
+	bash: {
+		question: numbered("Do you want to proceed?", OPTIONS),
+		options: OPTIONS,
+		fingerprint: "6a128b4273b95faa",
+		lasting: [2],
+		pending: { tool: "Bash", summary: `Bash: ${COMMAND}`, input: JSON.stringify({ command: COMMAND, description: "Show the notes" }) },
+	},
+	write: {
+		question: numbered("Do you want to create notes.md?", WRITE_OPTIONS),
+		options: WRITE_OPTIONS,
+		fingerprint: "c0ffee00c0ffee00",
+		lasting: [2],
+		pending: { tool: "Write", summary: `Write: ${NOTES}`, input: JSON.stringify({ file_path: NOTES, content: "notes" }) },
+	},
+	none: { question: "What should the file be called?" },
+};
+// the question routr recorded, and the one its screen shows (newer, before the watcher looks)
+const asked = (w) => MENUS[w.menu ?? "bash"];
+const onScreen = (w) => MENUS[w.screen ?? w.menu ?? "bash"];
+
+const FINAL = "Two findings; one blocks implementation.\n1. The token refresh races with logout.\n2. The migration drops sessions.";
+
+const args = process.argv.slice(2);
+const json = args.includes("--json");
+const pos = args.filter((a, i) => !a.startsWith("-") && !(args[i - 1] || "").match(/^--(role|output|permissions|answer|timeout|harness|model|effort|expect|by|menu)$/));
+const [cmd, arg1, arg2] = pos;
+const s = load();
+const now = Date.now();
+
+switch (cmd) {
+	case "seed": {
+		// smoke.zsh: a finished worker from long ago, and another session's live one
+		s.workers[2] = { role: "task", harness: "pi", model: "deepseek-v4-flash", brief: "old", startedAt: now - 3_600_000, fixed: "done" };
+		s.workers[3] = { role: "research", harness: "codex", model: "gpt-6-astra", effort: "low", brief: "theirs", startedAt: now - 60_000, fixed: "running" };
+		save(s);
+		list(s, now);
+		save(s);
+		break;
+	}
+	case "start": {
+		const id = s.nextId++;
+		const role = flag(args, "--role", "task");
+		s.workers[id] = {
+			role,
+			harness: role === "review" ? "codex" : "claude",
+			model: role === "review" ? "gpt-6-astra" : "sonnet",
+			effort: role === "review" ? "high" : "medium",
+			output: flag(args, "--output", role === "review" ? "REDTEAM.md" : undefined),
+			answerer: flag(args, "--answer", "human"),
+			brief: arg1 || "",
+			startedAt: now,
+			...(process.env.PI_SESSION_ID ? { caller: { harness: "pi", session: process.env.PI_SESSION_ID } } : {}),
+		};
+		list(s, now);
+		save(s);
+		console.error(`routr: queued worker ${id} ${role} · ${s.workers[id].harness} (${s.workers[id].harness} · ${s.workers[id].model})`);
+		console.log(json ? JSON.stringify(record(id, s.workers[id], now)) : String(id));
+		break;
+	}
+	case "flow": {
+		// flow start [NAME]: a chain whose steps follow each other on the clock
+		if (arg1 !== "start") {
+			console.error("fake routr: flow start only");
+			process.exit(2);
+		}
+		const chain = `demo-${(s.chains = (s.chains || 0) + 1)}`;
+		const step = runSecs * 1000;
+		const base = { chain, createdAt: now, answerer: flag(args, "--answer", "human"), ...(process.env.PI_SESSION_ID ? { caller: { harness: "pi", session: process.env.PI_SESSION_ID } } : {}) };
+		const add = (w) => {
+			const id = s.nextId++;
+			s.workers[id] = { ...base, brief: "", ...w };
+			console.error(`routr: queued worker ${id} ${w.step} · ${w.harness}`);
+			return id;
+		};
+		add({ step: "plan", role: "plan", harness: "claude", model: "opus", effort: "high", output: "PLAN.md", verdict: "pass", startedAt: now });
+		add({ step: "review", role: "review", harness: "codex", model: "gpt-6-astra", effort: "high", verdict: "pass", startedAt: now + step });
+		const parent = s.nextId++;
+		const copies = [0, 0, 1].map((slot) =>
+			add({ step: "implement", role: "implement", harness: "claude", model: "sonnet", verdict: "pass", parallel: 2, startedAt: now + (2 + slot) * step }),
+		);
+		s.workers[parent] = { ...base, step: "implement", role: "implement", harness: "claude", brief: "", fanout: { glob: "parts/*.md", max_items: 10, items: copies }, startedAt: now + 2 * step };
+		add({ step: "merge", role: "implement", harness: "claude", model: "sonnet", gate: "you", fixed: "gated", startedAt: now });
+		list(s, now);
+		save(s);
+		console.log(chain);
+		break;
+	}
+	case "list": {
+		const terminal = ["done", "closed", "cancelled", "failed", "maybe_done", "needs_you"];
+		const recs = list(s, now).filter(
+			(r) => args.includes("--all") || !terminal.includes(r.state) || now - Date.parse(r.updated) <= 3_600_000,
+		);
+		if (json) console.log(JSON.stringify(recs));
+		else for (const r of recs) console.log(`${r.id}  ${r.role}  ${r.harness}·${r.model}  ${r.state}`);
+		break;
+	}
+	case "result":
+	case "wait": {
+		const w = s.workers[arg1];
+		if (!w) {
+			console.error(`routr: no worker ${arg1}`);
+			process.exit(1);
+		}
+		const st = stateOf(w, now);
+		if (st !== "done") {
+			console.log(`still running: ${arg1} ${w.role} · ${w.harness}. Run: routr wait ${arg1}`);
+			process.exit(3);
+		}
+		console.log(`${FINAL}\n\noutput: ${w.output || "REDTEAM.md"}\nverdict: fail`);
+		break;
+	}
+	case "cancel": {
+		// ID or CHAIN; a worker that finished keeps its state and session (cmd/routr/commands.go)
+		const hit = Object.keys(s.workers).filter((id) => id === arg1 || s.workers[id].chain === arg1);
+		if (hit.length === 0) {
+			console.error(`routr: no worker ${arg1}`);
+			process.exit(1);
+		}
+		for (const id of hit) {
+			if (stateOf(s.workers[id], now) !== "done") s.workers[id].cancelled = true;
+			console.log(`routr: cancelled ${id} ${s.workers[id].role} · ${s.workers[id].harness}`);
+		}
+		list(s, now);
+		save(s);
+		break;
+	}
+	case "send": {
+		const w = s.workers[arg1];
+		if (!w || w.cancelled) {
+			console.error(w ? `routr: worker ${arg1} was cancelled` : `routr: no worker ${arg1}`);
+			process.exit(1);
+		}
+		w.turn = (w.turn ?? 0) + 1;
+		w.resumedAt = now;
+		list(s, now);
+		save(s);
+		console.log(`routr: sent to ${arg1}; its reply: turns/${w.turn}.md`);
+		break;
+	}
+	case "ask": {
+		const running = Object.keys(s.workers).filter((id) => stateOf(s.workers[id], now) === "running");
+		const id = arg1 ?? running.at(-1);
+		const w = s.workers[id];
+		const menu = flag(args, "--menu", "bash");
+		if (!w || !["running", "blocked"].includes(stateOf(w, now))) {
+			console.error(id ? `fake routr: worker ${id} is not running` : "fake routr: no running worker; routr start or routr flow start first");
+			process.exit(1);
+		}
+		if (!MENUS[menu]) {
+			console.error(`fake routr: --menu ${menu}: bash, write or none`);
+			process.exit(2);
+		}
+		if (args.includes("--screen-only")) {
+			w.screen = menu;
+		} else {
+			w.blockedAt ??= now;
+			w.menu = menu;
+			delete w.screen;
+		}
+		list(s, now);
+		save(s);
+		console.log(`blocked ${id}`);
+		break;
+	}
+	case "version": {
+		// FAKE_ROUTR_REV: the revision it says it was built from (default none);
+		// FAKE_ROUTR_REV=old: a routr from before the version command
+		const rev = process.env.FAKE_ROUTR_REV || "";
+		if (rev === "old") {
+			console.error(`routr: unknown command "version"; run routr help`);
+			process.exit(2);
+		}
+		console.log(JSON.stringify({ revision: rev, modified: false, go: "go1.26.7" }));
+		break;
+	}
+	case "answer": {
+		// a blocked worker goes on where it stopped; the time it waited does not count
+		const w = s.workers[arg1];
+		const expect = flag(args, "--expect");
+		const by = flag(args, "--by", "human");
+		const m = w?.blockedAt ? onScreen(w) : undefined;
+		const option = m?.options?.[Number(arg2) - 1];
+		if (by !== "human" && !expect) {
+			console.error(`routr answer: --by ${by} needs --expect FP: pass the worker's fingerprint from the [routr] message, routr wait or routr list --json.`);
+			process.exit(2);
+		}
+		if (m && expect && expect !== m.fingerprint) {
+			if (!m.fingerprint) {
+				console.error(`routr: worker ${arg1} shows no menu now: its question was answered or went away. No option was chosen. routr list shows where it is`);
+				process.exit(1);
+			}
+			console.error(`routr answer: ${arg1} asks another question now, so no option was chosen. On its screen (fingerprint ${m.fingerprint}):\n${m.question}\nDecide again, then: routr answer ${arg1} N --expect ${m.fingerprint}`);
+			process.exit(4);
+		}
+		if (m && !option) {
+			console.error(m.options ? `routr answer: worker: no option ${arg2}; pick 1-${m.options.length}` : `routr: worker ${arg1} shows no menu: answer it in its tab`);
+			process.exit(1);
+		}
+		if (m && by !== "human" && m.lasting.includes(Number(arg2))) {
+			console.error(`routr: option ${arg2} (${option}) saves a rule or allows more than this call, so only the user may pick it (--by human). Nothing was pressed.`);
+			process.exit(1);
+		}
+		if (m) {
+			w.startedAt += now - w.blockedAt;
+			if (w.resumedAt !== undefined) w.resumedAt += now - w.blockedAt;
+			w.answer = `${arg2}. ${option}`;
+			w.answeredBy = by;
+			delete w.blockedAt;
+			delete w.menu;
+			delete w.screen;
+			list(s, now);
+			save(s);
+		}
+		console.log(`ok: answer ${[arg1, arg2].filter(Boolean).join(" ")}`);
+		break;
+	}
+	case "show": {
+		if (!args.includes("--context")) {
+			console.log(`ok: show ${arg1}`);
+			break;
+		}
+		const w = s.workers[arg1];
+		if (!w) {
+			console.error(`routr: no worker ${arg1}`);
+			process.exit(1);
+		}
+		const slow = Number(process.env.FAKE_ROUTR_SLOW_CONTEXT_MS || 0);
+		if (slow > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, slow);
+		const m = stateOf(w, now) === "blocked" ? asked(w) : {};
+		console.log(
+			JSON.stringify({
+				worker: Number(arg1),
+				answerer: w.answerer ?? "human",
+				question: m.question,
+				options: m.options,
+				fingerprint: m.fingerprint,
+				lasting: m.lasting,
+				pending: m.pending,
+				brief: w.brief,
+				brief_path: join(dir, "runs", String(arg1), "brief.md"),
+				root: process.cwd(),
+				docs: [{ path: join(process.cwd(), "SPEC.md"), size: 31 }],
+				// who answers, a line each: the real CLI's text is its own (watch.QuestionContext.WhoAnswers); these stand in for it
+				answer: m.question
+					? [`fake routr: ${w.answerer ?? "human"} answers worker ${arg1}'s question.`, `fake routr: routr answer ${arg1} N --expect ${m.fingerprint ?? "-"}`]
+					: undefined,
+			}),
+		);
+		break;
+	}
+	case "approve":
+	case "hide":
+	case "close":
+		console.log(`ok: ${cmd} ${[arg1, arg2].filter(Boolean).join(" ")}`);
+		break;
+	case undefined:
+		console.log("fake routr: seed | start | flow start | ask | list | result | wait | send | answer | approve | show | hide | cancel | close");
+		break;
+	default:
+		console.error(`fake routr: unknown command ${cmd}`);
+		process.exit(2);
+}

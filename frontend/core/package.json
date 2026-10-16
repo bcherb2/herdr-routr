@@ -1,0 +1,5 @@
+{
+  "name": "routr-frontend-core",
+  "private": true,
+  "type": "module"
+}

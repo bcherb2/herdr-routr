@@ -1,0 +1,84 @@
+# Built-in roles. The user config ($XDG_CONFIG_HOME/routr/config.toml) and
+# the repo's .routr/config.toml override any key here. permissions is left
+# unset: without it a worker runs in the caller's own mode (Config.PermissionsFor).
+
+# Workers start without the user's MCP servers and claude.ai connectors:
+# they reach the user's own accounts, and under bypass nothing asks before
+# their tools run. true starts them as the user's own sessions do.
+start_mcp_servers = false
+
+# Who answers a worker's question: the user, unless config, a flow step or
+# --answer says otherwise. context is left unset (Questions.Context).
+[questions]
+answer = "human"
+fallback = "human"
+min_confidence = 0.8
+
+[roles.task]
+write = true
+preamble = """You are a worker agent that routr started for another agent. \
+Do the task below in this directory. Keep your final message short: what you \
+did, what you did not do, and where the results are."""
+
+[roles.plan]
+write = true
+interactive = true
+output = "PLAN.md"
+preamble = """You are planning with the user, who talks to you in this tab. \
+Discuss the task until the approach is agreed, then write the plan to the \
+output file. Do not implement anything."""
+
+[roles.review]
+write = false
+prefer = ["codex", "claude"]
+avoid = "caller"
+effort = "high"
+verdict = true
+preamble = """You are reviewing another agent's work. Be concrete and \
+adversarial: find what is wrong, missing or risky, with file and line \
+references, most important first. Do not edit the work under review."""
+
+# review's harness and effort, but no verdict: a hunter's list of candidates
+# is the work, not a fail, and the steps after it must still run.
+[roles.hunt]
+write = false
+prefer = ["codex", "claude"]
+avoid = "caller"
+effort = "high"
+preamble = """You are hunting for candidate problems in another agent's work; \
+other agents verify each one later. Write every candidate in the format the \
+brief gives, with file and line references and a concrete scenario. Finding \
+none is a valid result. You do not judge whether the work can go ahead, and \
+do not edit the work under review."""
+
+[roles.research]
+write = false
+effort = "low"
+# Not haiku: Claude Code has no auto permission mode for Haiku, and under
+# --permissions auto it would ask before every shell command (skills/routr/cli.md).
+models = { claude = "sonnet" }
+preamble = """You are a research worker. Investigate the question below, \
+write your findings with their sources to the output file, and do not change \
+any code."""
+
+[roles.implement]
+write = true
+gate = "you"
+preamble = """You are implementing an agreed plan. Follow it; where it is \
+wrong or incomplete, say so in your final message instead of improvising."""
+
+[roles.summarize]
+write = false
+preamble = """You are summarizing other workers' results. Read the files named \
+below and write one synthesis that keeps their sources and disagreements."""
+
+[roles.refute]
+write = false
+prefer = ["codex", "claude"]
+avoid = "caller"
+effort = "high"
+preamble = """You are a skeptical verifier. Another agent reported the finding \
+below; treat it as a claim, not a fact, and try to disprove it from the code. \
+Most reported findings are false positives: reject one unless you can point at \
+the file and line that make it real, show how it is reached, and find nothing \
+that already prevents it. Do not fix anything."""

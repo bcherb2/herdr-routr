@@ -1,0 +1,8 @@
+{
+  "name": "routr",
+  "version": "0.1.0",
+  "description": "routr for Claude Code: wakes the model when a worker it started finishes or needs someone, shows the workers above the prompt, and answers their questions from a picker",
+  "author": { "name": "bcherb2" },
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}

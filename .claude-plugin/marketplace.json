@@ -1,0 +1,6 @@
+{
+  "name": "routr",
+  "owner": { "name": "bcherb2" },
+  "description": "routr for Claude Code: wakes the model when a worker it started finishes or needs someone, shows the workers above the prompt, and answers their questions from a picker",
+  "plugins": [{ "name": "routr", "source": "./frontend" }]
+}

@@ -1,0 +1,792 @@
+# routr's built-in flows (skills/routr/flows.md). A flow file in
+# $XDG_CONFIG_HOME/routr/flows/ or <repo>/.routr/flows/ replaces one of these
+# by name.
+#
+# Brief refs: {{PARAM}}; {{STEP.output}}, {{STEP.final}}, {{STEP.verdict}} of
+# an upstream step; {{STEP.outputs}} of an upstream foreach step;
+# {{prev.*}} for the first step in `after`; {{item.path}}, {{item.name}} in
+# a foreach step. Briefs are rendered when the step starts.
+
+[flow.plan-redteam]
+description = "plan, then adversarial review"
+params = ["task"]
+
+[[flow.plan-redteam.step]]
+id     = "plan"
+role   = "task"        # one-shot, as the old pipeline; the plan role is interactive
+output = "PLAN.md"
+brief  = """
+Write an implementation plan to PLAN.md for this task: {{task}}
+Keep it under 40 lines. Do not implement anything."""
+
+[[flow.plan-redteam.step]]
+id      = "redteam"
+role    = "review"
+after   = ["plan"]
+output  = "REDTEAM.md"
+harness = "codex"
+effort  = "high"
+brief   = """
+Red-team the plan in {{plan.output}} for this task: {{task}}
+Find flaws, risks and missing test cases. Write your findings to REDTEAM.md.
+Do not modify {{plan.output}} or any code."""
+
+
+[flow.plan-to-impl]
+description = "plan with you, red-team it, gate, implement, review the code"
+params = ["task", "in"]         # routr flow start plan-to-impl --task "…" --in DECISIONS.md
+
+[[flow.plan-to-impl.step]]
+id = "plan"
+role = "plan"
+interactive = true              # you talk to it; it ends only on `routr done`
+output = "PLAN.md"
+brief = "Write PLAN.md for: {{task}}. Decisions so far are in {{in}}."
+
+[[flow.plan-to-impl.step]]
+id = "review"
+role = "review"                 # the role says "not the author's model"
+after = ["plan"]
+output = "REDTEAM.md"
+brief = "Red-team {{plan.output}}. Write REDTEAM.md."   # on_fail adds the ask for a verdict
+on_fail = { resume = "plan", brief = "Address {{review.output}}.", max = 3 }
+
+[[flow.plan-to-impl.step]]
+id = "implement"
+role = "implement"              # a write role, so it takes the directory lock
+after = ["review"]
+gate = "you"
+brief = "Implement {{plan.output}}."
+
+[[flow.plan-to-impl.step]]
+id = "code-review"
+role = "review"
+after = ["implement"]
+brief = "Review the diff since the chain started against {{plan.output}}."
+on_fail = { resume = "implement", brief = "Fix {{code-review.final}}.", max = 2 }
+
+
+[flow.research]
+description = "one research worker per brief file, then one synthesis"
+params = ["in"]                 # a directory of briefs: routr flow start research --in .routr/briefs
+
+[[flow.research.step]]
+id = "dig"
+role = "research"
+foreach = "{{in}}/*.md"         # one worker per brief file
+output = "research/{{item.name}}"
+brief = "Research the question in {{item.path}}. Write your findings to research/{{item.name}}."
+
+[[flow.research.step]]
+id = "synthesize"
+role = "summarize"
+after = ["dig"]                 # join: waits for all copies
+output = "research/SUMMARY.md"
+brief = "Synthesize {{dig.outputs}} into research/SUMMARY.md."
+
+
+# ---------------------------------------------------------------------------
+# The default workflow set. Intermediate
+# files go to {{work}}, the chain's own scratch directory; numbered files
+# (01-slug.md) are what a later foreach globs, so INDEX.md is never one.
+
+[flow.adversarial-review]
+description = "four lenses on two vendors, merge, a cold refuter per finding, report, Jev: ship or fix"
+params = ["target"]     # a git range (main...HEAD), a file or a directory
+
+[[flow.adversarial-review.step]]
+id      = "correctness"
+role    = "hunt"
+harness = "codex"
+output  = "{{work}}/lens-correctness.md"
+brief   = """
+Review {{target}} for correctness. If it is a git range, review `git diff {{target}}` \
+and the code around it; otherwise the files themselves. Judge the code, not what \
+commit messages or comments say it does.
+Look for: logic errors, unhandled edge cases and errors, wrong assumptions about \
+inputs or state, races, leaks, broken invariants.
+
+Write one file per finding to {{work}}/findings/correctness-NN.md (NN = 01, 02, …):
+  # <one-line title>
+  where: <file:line>
+  severity: high | medium | low
+  claim: <what is wrong, two or three sentences>
+  scenario: <concrete inputs or state → the wrong outcome>
+  fix: <the smallest change that fixes it>
+Report only what you can back with a concrete scenario; at most 8, most severe first.
+Then write {{work}}/lens-correctness.md listing the files you wrote, or "no findings"."""
+
+[[flow.adversarial-review.step]]
+id      = "design"
+role    = "hunt"
+harness = "claude"
+output  = "{{work}}/lens-design.md"
+brief   = """
+Review {{target}} for design and maintainability. If it is a git range, review \
+`git diff {{target}}` and the code around it; otherwise the files themselves. Judge \
+the code, not what commit messages or comments say it does.
+Look for: wrong or leaky abstractions, duplication of something that already exists, \
+needless complexity, a simpler approach that does the same, missing or weak tests for \
+the changed behavior, docs or comments the change made untrue.
+
+Write one file per finding to {{work}}/findings/design-NN.md (NN = 01, 02, …):
+  # <one-line title>
+  where: <file:line>
+  severity: high | medium | low
+  claim: <what is wrong, two or three sentences>
+  scenario: <what goes wrong because of it, concretely>
+  fix: <the smallest change that fixes it>
+Skip pure style. At most 8, most important first.
+Then write {{work}}/lens-design.md listing the files you wrote, or "no findings"."""
+
+[[flow.adversarial-review.step]]
+id      = "risk"
+role    = "hunt"
+harness = "codex"
+output  = "{{work}}/lens-risk.md"
+brief   = """
+Review {{target}} for risk. If it is a git range, review `git diff {{target}}` and \
+the code around it; otherwise the files themselves. Judge the code, not what commit \
+messages or comments say it does.
+Look for: security holes, data loss, unsafe defaults, backwards-incompatible changes, \
+performance cliffs, behavior under partial failure, retries or load.
+
+Write one file per finding to {{work}}/findings/risk-NN.md (NN = 01, 02, …):
+  # <one-line title>
+  where: <file:line>
+  severity: high | medium | low
+  claim: <what is wrong, two or three sentences>
+  scenario: <concrete inputs or state → the harm>
+  fix: <the smallest change that fixes it>
+Report only what you can back with a concrete scenario; at most 8, most severe first.
+Then write {{work}}/lens-risk.md listing the files you wrote, or "no findings"."""
+
+[[flow.adversarial-review.step]]
+id      = "premortem"
+role    = "hunt"
+harness = "claude"
+output  = "{{work}}/lens-premortem.md"
+brief   = """
+Run a pre-mortem on {{target}} (if it is a git range, the change `git diff {{target}}`; \
+otherwise the files themselves). Assume it shipped and, three months from now, caused \
+an incident or had to be reverted. Write the most plausible incident reports: what \
+happened, and which code made it possible.
+
+Write one file per incident to {{work}}/findings/premortem-NN.md (NN = 01, 02, …):
+  # <one-line title>
+  where: <file:line>
+  severity: high | medium | low
+  claim: <what in the code made it possible>
+  scenario: <the sequence of events that led to the incident>
+  fix: <the smallest change that would have prevented it>
+At most 5, most likely first.
+Then write {{work}}/lens-premortem.md listing the files you wrote, or "no findings"."""
+
+[[flow.adversarial-review.step]]
+id     = "merge"
+role   = "summarize"
+after  = ["correctness", "design", "risk", "premortem"]
+output = "{{work}}/merged/INDEX.md"
+brief  = """
+Merge the review findings in {{work}}/findings/ (the lenses' lists: {{correctness.output}}, \
+{{design.output}}, {{risk.output}}, {{premortem.output}}). Lenses often find the same \
+problem: write each distinct problem once to {{work}}/merged/NN-slug.md (NN = 01, 02, …), \
+in the same format, with a `lenses:` line naming every lens that raised it, and the most \
+concrete scenario among them. Don't judge whether findings are true; that comes next.
+Then write {{work}}/merged/INDEX.md, one line per merged file. With no findings at all, \
+write only INDEX.md, saying so."""
+
+[[flow.adversarial-review.step]]
+id          = "refute"
+role        = "refute"
+after       = ["merge"]
+foreach     = "{{work}}/merged/[0-9]*.md"
+allow_empty = true
+max_items   = 30
+parallel    = 4
+output      = "{{work}}/verdicts/{{item.name}}"
+brief       = """
+Verify the finding in {{item.path}} against the work under review, {{target}}. Read the \
+code it points at and the code that reaches it.
+Write {{work}}/verdicts/{{item.name}}: the first line is CONFIRMED or REJECTED; then the \
+evidence, with file:line references. For CONFIRMED: how the failure is reached and why \
+nothing prevents it. For REJECTED: what makes the claim wrong (it can't be reached, it is \
+already handled, it is intended, or it is a matter of taste)."""
+
+[[flow.adversarial-review.step]]
+id     = "report"
+role   = "summarize"
+after  = ["refute"]
+output = "{{work}}/REVIEW.md"
+brief  = """
+Write the review of {{target}} to {{work}}/REVIEW.md, from the findings in \
+{{work}}/merged/ and their verdicts: {{refute.outputs}}.
+Start with one tally line: N findings, C confirmed, R rejected. Then the confirmed \
+findings, most severe first, each with where, scenario, fix and the verifier's evidence. \
+Then a Rejected section, one line each with the reason, so a human can catch a wrong \
+rejection."""
+
+[[flow.adversarial-review.step]]
+id    = "ship"
+judge = "jev"
+after = ["report"]
+pass  = "no confirmed finding needs fixing before this ships"
+fail  = "at least one confirmed finding should be fixed first"
+brief = "From the review report, decide whether {{target}} can ship as it is."
+
+
+[flow.security-review]
+description = "threat model, three hunters on two vendors, merge, a cold verifier per candidate, report"
+params = ["scope"]      # a directory, files, or a git range
+
+[[flow.security-review.step]]
+id      = "map"
+role    = "research"
+harness = "claude"
+effort  = "high"
+output  = "{{work}}/THREATS.md"
+brief   = """
+Map the attack surface of {{scope}}: a directory, files, or a git range (then the code \
+it changes and what that code touches).
+Write {{work}}/THREATS.md: what the code does; its entry points and who controls each \
+input (users, the network, files, other processes, the environment); trust boundaries; \
+the assets worth attacking; then the 3–6 threat classes that matter most here, each with \
+where to look. Don't report vulnerabilities yet."""
+
+[[flow.security-review.step]]
+id      = "inject"
+role    = "hunt"
+harness = "codex"
+after   = ["map"]
+output  = "{{work}}/hunt-inject.md"
+brief   = """
+Hunt for vulnerabilities in {{scope}}, guided by the threat model in {{map.output}}.
+Your focus is untrusted data reaching a dangerous sink: shell commands, SQL, file paths \
+(traversal, symlinks), templates and format strings, deserialization, URLs fetched \
+(SSRF), file writes, escape sequences printed to a terminal.
+
+Trace each candidate from a source an attacker controls to the sink where it does harm. \
+Write one file per candidate to {{work}}/candidates/inject-NN.md (NN = 01, 02, …):
+  # <title>
+  class: <CWE id and name>
+  where: <file:line of the sink>
+  source: <the attacker-controlled input, file:line>
+  path: <hop by hop, source to sink>
+  attacker: <who, and what they must already have>
+  impact: <what they gain>
+  severity: critical | high | medium | low
+Only candidates with a concrete path; at most 8.
+Then write {{work}}/hunt-inject.md listing your files, or "nothing found"."""
+
+[[flow.security-review.step]]
+id      = "access"
+role    = "hunt"
+harness = "claude"
+after   = ["map"]
+output  = "{{work}}/hunt-access.md"
+brief   = """
+Hunt for vulnerabilities in {{scope}}, guided by the threat model in {{map.output}}.
+Your focus is access and secrets: missing or bypassable authentication and \
+authorization, secrets in code, logs or error messages, weak crypto or randomness, \
+permissions on files, directories and sockets, information leaks.
+
+Trace each candidate from a source an attacker controls to the place where it does harm. \
+Write one file per candidate to {{work}}/candidates/access-NN.md (NN = 01, 02, …):
+  # <title>
+  class: <CWE id and name>
+  where: <file:line>
+  source: <the attacker-controlled input or position, file:line>
+  path: <hop by hop>
+  attacker: <who, and what they must already have>
+  impact: <what they gain>
+  severity: critical | high | medium | low
+Only candidates with a concrete path; at most 8.
+Then write {{work}}/hunt-access.md listing your files, or "nothing found"."""
+
+[[flow.security-review.step]]
+id      = "robust"
+role    = "hunt"
+harness = "codex"
+after   = ["map"]
+output  = "{{work}}/hunt-robust.md"
+brief   = """
+Hunt for vulnerabilities in {{scope}}, guided by the threat model in {{map.output}}.
+Your focus is robustness under attack: races and time-of-check/time-of-use, resource \
+exhaustion, unsafe defaults, trusting the environment (PATH, environment variables, \
+temp files, symlinks), dependencies and the supply chain.
+
+Trace each candidate from a source an attacker controls to the place where it does harm. \
+Write one file per candidate to {{work}}/candidates/robust-NN.md (NN = 01, 02, …):
+  # <title>
+  class: <CWE id and name>
+  where: <file:line>
+  source: <the attacker-controlled input or position, file:line>
+  path: <hop by hop>
+  attacker: <who, and what they must already have>
+  impact: <what they gain>
+  severity: critical | high | medium | low
+Only candidates with a concrete path; at most 8.
+Then write {{work}}/hunt-robust.md listing your files, or "nothing found"."""
+
+[[flow.security-review.step]]
+id     = "merge"
+role   = "summarize"
+after  = ["inject", "access", "robust"]
+output = "{{work}}/merged/INDEX.md"
+brief  = """
+Merge the vulnerability candidates in {{work}}/candidates/ (the hunters' lists: \
+{{inject.output}}, {{access.output}}, {{robust.output}}). Write each distinct candidate \
+once to {{work}}/merged/NN-slug.md (NN = 01, 02, …), in the same format, with a \
+`hunters:` line naming every hunter that found it. Don't judge whether they are real; \
+that comes next.
+Then write {{work}}/merged/INDEX.md, one line per merged file. With no candidates at all, \
+write only INDEX.md, saying so."""
+
+[[flow.security-review.step]]
+id          = "verify"
+role        = "refute"
+after       = ["merge"]
+foreach     = "{{work}}/merged/[0-9]*.md"
+allow_empty = true
+max_items   = 30
+parallel    = 4
+output      = "{{work}}/verdicts/{{item.name}}"
+brief       = """
+Verify the vulnerability candidate in {{item.path}} against the code ({{scope}}); \
+{{map.output}} has the threat model. Check three things and report each:
+- reachable: can an attacker get input to that point, along that path?
+- impact: does it gain them anything they didn't already have?
+- defenses: does validation, escaping, a sandbox, permissions or the deployment already \
+prevent it?
+Write {{work}}/verdicts/{{item.name}}: the first line is TRUE_POSITIVE, FALSE_POSITIVE, \
+or PREDATES_CHANGE (real, but {{scope}} is a git range and the code before it already \
+had it); then the evidence for each check, with file:line references. Don't run \
+exploits."""
+
+[[flow.security-review.step]]
+id     = "report"
+role   = "summarize"
+after  = ["verify"]
+output = "{{work}}/SECURITY.md"
+brief  = """
+Write the security review of {{scope}} to {{work}}/SECURITY.md, from the candidates in \
+{{work}}/merged/ and their verdicts: {{verify.outputs}}. {{map.output}} has the threat model.
+Start with one tally line: N candidates, T true positives, P predating the change, F \
+false positives. Then the true positives, most severe first, each with class, where, \
+path, impact, the verifier's evidence and a recommended fix. Then those that predate \
+the change. Then a False positives section, one line each with the reason, so a human \
+can catch a wrong rejection."""
+
+[[flow.security-review.step]]
+id    = "ship"
+judge = "jev"
+after = ["report"]
+pass  = "no confirmed vulnerability of high or critical severity"
+fail  = "at least one confirmed vulnerability of high or critical severity"
+brief = "From the security review, decide whether {{scope}} has a confirmed high or critical vulnerability."
+
+
+[flow.deep-research]
+description = "split a question, one researcher per part, synthesize, fact-check"
+params = ["task"]       # the question
+
+[[flow.deep-research.step]]
+id     = "split"
+role   = "research"
+effort = "medium"
+output = "{{work}}/briefs/INDEX.md"
+brief  = """
+Split this research question into 2–5 independent sub-questions that together answer it:
+{{task}}
+
+Write each as a self-contained brief to {{work}}/briefs/NN-slug.md (NN = 01, 02, …): the \
+sub-question, why it matters to the whole, what a good answer includes, and where to \
+look: the web, unless the question names this repository or its files; then name them. \
+Don't send a researcher into this repository otherwise. A researcher will see only that \
+file. Then write {{work}}/briefs/INDEX.md listing them. Don't answer the questions."""
+
+[[flow.deep-research.step]]
+id        = "dig"
+role      = "research"
+after     = ["split"]
+foreach   = "{{work}}/briefs/[0-9]*.md"
+max_items = 6
+parallel  = 4
+output    = "{{work}}/findings/{{item.name}}"
+brief     = """
+Research the question in {{item.path}}. Write your findings to \
+{{work}}/findings/{{item.name}}: the answer first, then the evidence, with a source (a URL, \
+or file:line) for every claim, then what you could not find out."""
+
+[[flow.deep-research.step]]
+id     = "synthesize"
+role   = "summarize"
+after  = ["dig"]
+output = "{{work}}/REPORT.md"
+brief  = """
+Answer this question from the findings in {{dig.outputs}}:
+{{task}}
+
+Write {{work}}/REPORT.md: the answer first, then the reasoning. Keep each claim's source, \
+and say where the findings disagree or are thin."""
+
+[[flow.deep-research.step]]
+id      = "factcheck"
+role    = "review"
+after   = ["synthesize"]
+output  = "{{work}}/FACTCHECK.md"
+brief   = """
+Fact-check {{synthesize.output}}. A findings file is not a source: the findings in \
+{{work}}/findings/ only say where a claim came from. For every claim the report rests on \
+(at least the five most load-bearing), open its cited URL or file:line yourself. Write \
+{{work}}/FACTCHECK.md listing each claim you checked with the source you opened and what \
+it says, and your call: supported, overstated, contradicted, or unverified (you could not \
+open the source). Fail if a load-bearing claim is contradicted or unverified; otherwise \
+pass if the report holds up apart from nits. Your verdict says how many claims you \
+checked against their sources."""
+on_fail = { resume = "synthesize", brief = "Correct the report: {{factcheck.output}} lists the claims that don't hold up or could not be verified. Fix or drop them.", max = 2 }
+
+
+[flow.fix-until-green]
+description = "gate, implement until a check passes, audit the done-claims, check again"
+params = ["task", "check"]      # --param check='go test ./...'
+
+[[flow.fix-until-green.step]]
+id    = "implement"
+role  = "implement"             # a gate: you approve before it starts
+brief = """
+{{task}}
+
+When you think you are done, run `{{check}}` and make it pass. Don't weaken, skip or \
+delete tests or checks to get there. Don't commit."""
+
+[[flow.fix-until-green.step]]
+id      = "verify"
+run     = "{{check}}"
+after   = ["implement"]
+on_fail = { resume = "implement", brief = "`{{check}}` failed; its log is {{verify.output}}. Fix the cause in the code. Don't weaken, skip or delete tests; if a test is wrong, say so and why.", max = 5 }
+
+[[flow.fix-until-green.step]]
+id      = "audit"
+role    = "review"
+after   = ["verify"]
+output  = "{{work}}/AUDIT.md"
+brief   = """
+Audit what the implementer says it did. The task was:
+{{task}}
+
+Its final message is {{implement.final}}. Check each claim in it ("added X", "handled Y", \
+"tests cover Z") against the actual changes: `git diff HEAD`, and `git status` for new \
+files. Check too that no test or check was weakened, skipped or deleted to make \
+`{{check}}` pass, and that the task is done, not just the check green.
+Write {{work}}/AUDIT.md: each claim, true or false, with the evidence; then anything the \
+task asked for that is missing. Pass only if every claim holds and nothing is missing."""
+on_fail = { resume = "implement", brief = "Fix what the audit found, in {{audit.output}}.", max = 2 }
+
+[[flow.fix-until-green.step]]
+id      = "green"
+run     = "{{check}}"
+after   = ["audit"]
+on_fail = { resume = "implement", brief = "`{{check}}` fails again after your last change; its log is {{green.output}}. Fix the cause in the code.", max = 2 }
+
+
+[flow.repro-fix]
+description = "a blind reproducer writes a failing test, prove it fails, gate, fix, review, prove it passes untouched"
+params = ["bug"]
+
+[[flow.repro-fix.step]]
+id     = "reproduce"
+role   = "task"
+output = "{{work}}/repro.sh"
+brief  = """
+Reproduce this bug with a failing automated test. Don't fix it.
+{{bug}}
+
+1. Find where the bug lives and add the smallest test that fails because of it, in the \
+repo's own test suite and style. It must fail for the bug's reason, not a typo or a \
+missing import.
+2. Write {{work}}/repro.sh: a shell script that first does \
+`cd "$(git rev-parse --show-toplevel)"`, then runs only that test (e.g. `go test ./pkg \
+-run TestX`) and exits non-zero when it fails.
+3. Write {{work}}/tests.txt: the absolute paths of the test files you added or changed, \
+one per line.
+Don't change any code that isn't a test."""
+
+[[flow.repro-fix.step]]
+id      = "fails"
+run     = "sh {{work}}/repro.sh"
+expect  = "fail"
+after   = ["reproduce"]
+on_fail = { resume = "reproduce", brief = "repro.sh passed on the unfixed code, so it doesn't reproduce the bug; its log is {{fails.output}}. Make the test fail for the bug's reason.", max = 2 }
+
+[[flow.repro-fix.step]]
+id    = "snapshot"
+run   = "{ cat {{work}}/tests.txt; echo {{work}}/repro.sh; } | xargs sha256sum > {{work}}/tests.sha256"
+after = ["fails"]
+
+[[flow.repro-fix.step]]
+id    = "fix"
+role  = "implement"             # a gate: you see the reproducing test first
+after = ["snapshot"]
+brief = """
+Fix this bug:
+{{bug}}
+
+A failing test reproduces it; {{reproduce.final}} says which. Fix the cause so that \
+`sh {{work}}/repro.sh` passes, and keep the rest of the test suite passing. Don't change \
+the test files listed in {{work}}/tests.txt or {{work}}/repro.sh: the test is the spec. \
+Don't commit."""
+
+[[flow.repro-fix.step]]
+id      = "review"
+role    = "review"
+after   = ["fix"]
+output  = "{{work}}/REVIEW.md"
+brief   = """
+Review the fix for this bug:
+{{bug}}
+
+The fix is the uncommitted diff (`git diff HEAD`); {{reproduce.final}} describes the \
+reproducing test. Does it fix the cause, not the symptom? Could it break other callers? \
+Does it miss related cases the test doesn't cover? Write {{work}}/REVIEW.md, most \
+important first."""
+on_fail = { resume = "fix", brief = "Address the review in {{review.output}}.", max = 2 }
+
+[[flow.repro-fix.step]]
+id      = "verify"
+run     = "sha256sum -c --quiet {{work}}/tests.sha256 && sh {{work}}/repro.sh"
+after   = ["review"]
+on_fail = { resume = "fix", brief = "Either a reproducing test was changed (restore it: the test is the spec) or it still fails; the log is {{verify.output}}.", max = 3 }
+
+
+[flow.debug-hypotheses]
+description = "competing root-cause hypotheses, one falsifier each, Jev picks, gate, fix, review"
+params = ["bug"]
+
+[[flow.debug-hypotheses.step]]
+id     = "triage"
+role   = "research"
+effort = "medium"
+output = "{{work}}/hypotheses/INDEX.md"
+brief  = """
+Investigate this bug just enough to form competing explanations:
+{{bug}}
+
+Write 2–4 hypotheses about its root cause to {{work}}/hypotheses/NN-slug.md (NN = 01, \
+02, …). Make them really different, not variations of one idea. Each file: the claim \
+(what is wrong, and where); what you would observe if it is true; the cheapest \
+experiment that would prove it false (a command, a test, a log line, a code path to \
+read). Then write {{work}}/hypotheses/INDEX.md listing them. Don't fix anything."""
+
+[[flow.debug-hypotheses.step]]
+id        = "investigate"
+role      = "research"
+effort    = "medium"
+after     = ["triage"]
+foreach   = "{{work}}/hypotheses/[0-9]*.md"
+max_items = 4
+parallel  = 4
+output    = "{{work}}/evidence/{{item.name}}"
+brief     = """
+Test the hypothesis in {{item.path}} about this bug:
+{{bug}}
+
+Try hard to prove it false: run the experiment it names, and others; read the code. Other \
+investigators work in this directory at the same time, so don't edit the repo's files: \
+put any scratch test or script under {{work}}/scratch/.
+Write {{work}}/evidence/{{item.name}}: the first line is SUPPORTED, REFUTED or \
+INCONCLUSIVE; then the hypothesis in one line; then the evidence (commands and their \
+output, file:line references)."""
+
+[[flow.debug-hypotheses.step]]
+id    = "pick"
+judge = "jev"
+pick  = true
+after = ["investigate"]
+brief = """
+Which hypothesis is the root cause of this bug, judging by the evidence gathered for \
+it? Evidence from experiments beats reasoning; a REFUTED hypothesis is not the answer.
+The bug: {{bug}}"""
+
+[[flow.debug-hypotheses.step]]
+id    = "fix"
+role  = "implement"             # a gate: you see the pick first
+after = ["pick"]
+brief = """
+Fix this bug:
+{{bug}}
+
+The root cause, with the evidence for it, is in {{pick.output}}; the other hypotheses and \
+their evidence are in {{work}}/evidence/. Fix the cause, add a regression test that fails \
+without the fix, and keep the test suite passing. If the evidence doesn't hold up once \
+you are in the code, stop and say so instead of fixing something else. Don't commit."""
+
+[[flow.debug-hypotheses.step]]
+id      = "review"
+role    = "review"
+after   = ["fix"]
+output  = "{{work}}/REVIEW.md"
+brief   = """
+Review the fix for this bug:
+{{bug}}
+
+The fix is the uncommitted diff (`git diff HEAD`); the root cause it targets is in \
+{{pick.output}}. Does it fix that cause, not a symptom? Is the regression test real (does \
+it fail without the fix)? Could it break other callers? Write {{work}}/REVIEW.md, most \
+important first."""
+on_fail = { resume = "fix", brief = "Address the review in {{review.output}}.", max = 2 }
+
+
+[flow.best-of-n]
+description = "gate, three attempts on three harnesses in their own worktrees, check each, Jev picks, review the winner"
+params = ["task", "check"]      # --param check='go test ./...', run from the repo's top
+
+[[flow.best-of-n.step]]
+id   = "go"
+run  = "true"
+gate = "you"                    # one gate for all three attempts
+
+[[flow.best-of-n.step]]
+id       = "a"
+role     = "task"
+harness  = "claude"
+worktree = true
+after    = ["go"]
+output   = "{{work}}/attempt-a.md"
+brief    = """
+{{task}}
+
+You are one of three independent attempts at this task, each in its own git worktree; \
+this directory is yours. Make `{{check}}` pass without weakening, skipping or deleting \
+tests. When you are done, commit your work on this branch if your sandbox lets you; \
+otherwise leave it uncommitted in the worktree.
+Then write {{work}}/attempt-a.md: your worktree path and branch (`pwd`, `git branch \
+--show-current`), the approach you took and why, its trade-offs, and the result of \
+`{{check}}`."""
+
+[[flow.best-of-n.step]]
+id       = "b"
+role     = "task"
+harness  = "codex"
+worktree = true
+after    = ["go"]
+output   = "{{work}}/attempt-b.md"
+brief    = """
+{{task}}
+
+You are one of three independent attempts at this task, each in its own git worktree; \
+this directory is yours. Make `{{check}}` pass without weakening, skipping or deleting \
+tests. When you are done, commit your work on this branch if your sandbox lets you; \
+otherwise leave it uncommitted in the worktree.
+Then write {{work}}/attempt-b.md: your worktree path and branch (`pwd`, `git branch \
+--show-current`), the approach you took and why, its trade-offs, and the result of \
+`{{check}}`."""
+
+[[flow.best-of-n.step]]
+id       = "c"
+role     = "task"
+harness  = "pi"
+worktree = true
+after    = ["go"]
+output   = "{{work}}/attempt-c.md"
+brief    = """
+{{task}}
+
+You are one of three independent attempts at this task, each in its own git worktree; \
+this directory is yours. Make `{{check}}` pass without weakening, skipping or deleting \
+tests. When you are done, commit your work on this branch if your sandbox lets you; \
+otherwise leave it uncommitted in the worktree.
+Then write {{work}}/attempt-c.md: your worktree path and branch (`pwd`, `git branch \
+--show-current`), the approach you took and why, its trade-offs, and the result of \
+`{{check}}`."""
+
+# Each check runs in its attempt's worktree, from the top, and records its exit
+# status instead of failing: one failed attempt mustn't hold up the pick.
+[[flow.best-of-n.step]]
+id    = "check-a"
+run   = 'cd {{a.worktree}} && { {{check}}; echo "check exit status: $?"; }'
+after = ["a"]
+
+[[flow.best-of-n.step]]
+id    = "check-b"
+run   = 'cd {{b.worktree}} && { {{check}}; echo "check exit status: $?"; }'
+after = ["b"]
+
+[[flow.best-of-n.step]]
+id    = "check-c"
+run   = 'cd {{c.worktree}} && { {{check}}; echo "check exit status: $?"; }'
+after = ["c"]
+
+[[flow.best-of-n.step]]
+id    = "pick"
+judge = "jev"
+pick  = true
+after = ["a", "b", "c", "check-a", "check-b", "check-c"]
+brief = """
+Which attempt does this task best? Each check's log ends with "check exit status: N"; \
+an attempt whose check exited 0 beats one whose check did not; after that, prefer the one that does exactly what was asked with the smallest, \
+clearest change. The task: {{task}}"""
+
+[[flow.best-of-n.step]]
+id      = "review"
+role    = "review"
+after   = ["pick"]
+output  = "{{work}}/REVIEW.md"
+brief   = """
+Review the attempt Jev picked for this task: {{task}}
+{{pick.output}} describes it. Its worktree is {{pick.worktree}}, on branch \
+{{pick.branch}}; review its changes there, committed and not (`git log -p` since it \
+branched, and `git diff HEAD`). The other attempts are described in \
+{{work}}/attempt-*.md. Is the winner correct and complete? Does another attempt do \
+something clearly better that should be carried over? Write {{work}}/REVIEW.md, most \
+important first, ending with how to bring the winner into the main tree (merge the \
+branch, or commit what is uncommitted first)."""
+
+[flow.compare-models]
+description = "one prompt to seven open-weight models at once, a reviewer ranks their answers"
+params = ["task"]
+
+# One Pi worker per model, over OpenRouter (docs/default-flows.md). The
+# models are cheap open-weight picks from different vendors; Pi resolves
+# each id against its own providers, so they must be ones it serves.
+[[flow.compare-models.step]]
+id       = "field"
+role     = "research"             # write = false: a copy writes only its answer file
+harness  = "pi"
+parallel = 7
+models   = [
+  "openrouter/deepseek/deepseek-v4-flash",
+  "openrouter/z-ai/glm-5.3-flash",
+  "openrouter/qwen/qwen3.8-flash",
+  "openrouter/moonshotai/kimi-k2.5",
+  "openrouter/mistralai/mistral-medium-3.1",
+  "openrouter/minimax/minimax-m2.7",
+  "openrouter/bytedance-seed/seed-2.0-mini",
+]
+output   = "{{work}}/answers/{{item.name}}.md"
+brief    = """
+{{task}}
+
+You are one of several different models answering this same prompt, each on \
+your own; the others cannot see your work. Answer as well as you can, on your \
+own merits: show your reasoning in the answer itself, then the result, so a \
+reviewer can judge the quality and not just the conclusion. Do not change any \
+code, and write nothing outside your answer file.
+Write your answer to {{work}}/answers/{{item.name}}.md."""
+
+[[flow.compare-models.step]]
+id      = "compare"
+role    = "summarize"
+harness = "claude"
+after   = ["field"]
+output  = "{{work}}/COMPARISON.md"
+brief   = """
+Each of these files was written by a different model answering the same \
+prompt, independently; the file's name says which model: {{field.outputs}}
+Compare them and write {{work}}/COMPARISON.md:
+- a table, one row per model: correct or not, how complete, how clear, and \
+one line of evidence quoted from its answer
+- where they disagree, who is right and how you know
+- a ranking, best first, and why the best one wins
+- what even the best answer misses
+The prompt was: {{task}}"""

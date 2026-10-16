@@ -1,0 +1,35 @@
+{
+  "name": "routr-pi",
+  "version": "0.1.0",
+  "description": "Pi front end for routr: live worker cards, tool-call tails, and waking the model when a worker it started finishes",
+  "type": "module",
+  "private": true,
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bcherb2/herdr-routr.git",
+    "directory": "pi"
+  },
+  "homepage": "https://github.com/bcherb2/herdr-routr/tree/main/pi#readme",
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "scripts": {
+    "test": "node --test test/*.test.ts ../frontend/core/test/*.spec.ts",
+    "typecheck": "tsc --noEmit -p . && tsc --noEmit -p ../frontend/core"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=1.0.0",
+    "@earendil-works/pi-tui": ">=1.0.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.0.4",
+    "@earendil-works/pi-tui": "1.0.4",
+    "@types/node": "^24",
+    "typescript": "^5.9"
+  },
+  "engines": {
+    "node": ">=22.19"
+  }
+}
