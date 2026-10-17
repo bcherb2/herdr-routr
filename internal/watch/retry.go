@@ -22,11 +22,15 @@ const (
 
 // lasting are signs of an API error that waiting won't fix, unless the
 // harness itself says to try again.
-var lasting = regexp.MustCompile(`(?i)/login|log ?in again|sign in|authenticat|unauthori[sz]ed|api key|expired|credit balance|billing|usage limit|hit your limit|quota|/model|may not exist|not have access`)
+var lasting = regexp.MustCompile(`(?i)/login|log ?in again|sign in|authenticat|unauthori[sz]ed|api key|expired|credit balance|insufficient balance|payment required|\b402\b|billing|usage limit|hit your limit|quota|/model|may not exist|not have access`)
 
 func transient(msg string) bool {
 	return strings.Contains(strings.ToLower(msg), "try again") || !lasting.MatchString(msg)
 }
+
+// Lasting says an API error is one waiting won't fix (credit, quota, a
+// login): a model that hits it moves to its [[fallback]] instead of retrying.
+func Lasting(msg string) bool { return !transient(msg) }
 
 // turnFailed handles a settled idle whose turn ended in the harness's API
 // error: it schedules a retry, sends one that is due, or gives up.

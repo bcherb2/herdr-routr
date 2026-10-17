@@ -65,6 +65,11 @@ fi
 [[ $(whence -p routr 2>/dev/null) == $dest ]] \
   || warn "the routr on PATH is $(whence -p routr 2>/dev/null || print none), not $dest"
 
+# --- user config --------------------------------------------------------------
+# The first time, a template with every key commented out and explained; a
+# file that exists is never touched (routr config example prints the template).
+$dest config init
+
 # --- skill --------------------------------------------------------------------
 # link TARGET LINK: create or repoint a symlink; never replace a real file.
 link() {

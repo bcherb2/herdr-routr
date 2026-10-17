@@ -279,3 +279,14 @@ test("a background routr wait covers its workers until its shell ends: completed
 	c.backgroundEnded("bg3", "routr start --wait 'a; b'", true);
 	assert.deepEqual(c.snapshot([{ ...w, state: "done" }]).wake, []);
 });
+
+test("while the front end compacts the model's context, news waits, a question too, and resume says it is due", () => {
+	const { c } = setup();
+	c.snapshot([worker(1, "running"), worker(2, "running")]);
+	c.pause();
+	assert.deepEqual(ids(c.snapshot([worker(1, "done"), worker(2, "blocked", { question: "ok?" })]).wake), [], "a wake turn would race the compaction");
+	assert.deepEqual(ids(c.held()), ["1:done", "2:blocked"]);
+	assert.equal(c.resume(), true, "take a snapshot soon");
+	assert.deepEqual(ids(c.snapshot([worker(1, "done"), worker(2, "blocked", { question: "ok?" })]).wake), ["1:done", "2:blocked"]);
+	assert.equal(c.resume(), false, "nothing held");
+});

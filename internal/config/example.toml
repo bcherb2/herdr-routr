@@ -1,0 +1,81 @@
+# routr config: your own, for every repo. `routr config init` wrote it once
+# and never touches it again. Every key is optional. A commented value is
+# the default unless its note says it is an example; to change a key, delete
+# the leading # of it and of its [section]. A repo's .routr/config.toml lays
+# over this file key by key, and a list there (from, to, prefer,
+# [[fallback]]) replaces the one here. `routr doctor` checks it; the full
+# reference is skills/routr/cli.md, "Roles and config".
+
+# The permissions a worker gets without --permissions: default, auto or
+# bypass. Unset (no default shown): the caller's own mode; a Pi caller's
+# workers get bypass, since Pi asks for no approvals.
+#permissions = "auto"
+
+# true: workers start your MCP servers and claude.ai connectors, as your own
+# sessions do. They reach your accounts, and under bypass nothing asks first.
+#start_mcp_servers = false
+
+# Variables exported in every worker's tab (~/ and $VAR are expanded). An
+# example: workers on another Claude account.
+#[env]
+#CLAUDE_CONFIG_DIR = "~/.claude-work"
+
+# How long finished workers are kept in the registry.
+#[registry]
+#keep_days = 14
+#max = 200
+
+# Who answers a worker's question: human, agent (the agent that started it)
+# or jev (a model that decides, handing over below min_confidence).
+#[questions]
+#answer = "human"
+#fallback = "human"
+#min_confidence = 0.8
+# The project docs agent and jev read; unset: the first of .design/SPEC.md,
+# SPEC.md, README.md. An example:
+#context = ["SPEC.md", "docs/design.md"]
+
+# The main agent (the session that starts workers, never a worker): once a
+# run ends with its context past `at` tokens, cut it before the next turn.
+# truncate: a note in place of the earlier conversation (your first message
+# word for word, what you wrote since, the todo list, the workers) and the
+# last keep_turns turns, at most keep_tokens; no model call. summarize: the
+# harness's own summary. off: leave it. 0 is the default, -1 no limit.
+#[main]
+#context = "truncate"
+#at = 150000
+#keep_turns = 3
+#keep_tokens = 40000
+#strip_reasoning = true
+
+# Where a model's work goes when it fails in a way waiting won't fix: out of
+# credit or quota, a usage limit, a login. The first rule whose `from` globs
+# (on harness:model; * spans / and :) match wins; its `to` models are tried
+# in order, and one that fails too moves on down the same list. With no
+# rule, the model stops and you are told. A Pi main agent takes only pi:
+# models (pi:PROVIDER/ID, with :LEVEL for a thinking level). Examples:
+#[[fallback]]
+#from = ["*deepseek-v4-pro", "*deepseek-v4-flash"]
+#to = ["pi:openrouter/deepseek/deepseek-v4.1-flash", "pi:openrouter/anthropic/claude-haiku-5.5"]
+#[[fallback]]
+#from = ["*opus*"]
+#to = ["codex:gpt-6.1", "pi:openrouter/moonshotai/kimi-3"]
+
+# Per harness: the model and effort a worker gets when its role names none
+# (unset: the harness's own default), and extra arguments after routr's
+# own. Examples:
+#[harness.claude]
+#model = "sonnet"
+#effort = "high"
+#args = ["--add-dir", "/shared"]
+#[harness.codex]
+#model = "gpt-6-astra"
+#[harness.pi]
+#model = "openrouter/deepseek/deepseek-v4.1-flash"
+
+# Roles: `routr roles` lists the built-in ones (task, plan, review, hunt,
+# research, implement, summarize, refute) and what each picks now. Any key
+# of one can be changed here, or a new role added. An example:
+#[roles.review]
+#prefer = ["codex", "claude"]
+#effort = "xhigh"

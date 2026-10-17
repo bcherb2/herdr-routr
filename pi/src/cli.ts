@@ -1,6 +1,7 @@
 // Running the routr CLI. The extension never touches the registry itself.
 
 import { execFile } from "node:child_process";
+import { mainFromEnv, parseMain, type MainAgent } from "./context.ts";
 
 export interface RunResult {
 	code: number;
@@ -65,4 +66,26 @@ export async function staleBinary(repo: string, cwd: string): Promise<Stale | un
 		});
 	});
 	return code === 1 ? { revision: revision.slice(0, 12), repo } : undefined;
+}
+
+/** The main agent's settings, and what went wrong reading them, if the user should hear it. */
+export interface MainRead {
+	main: MainAgent;
+	error?: string;
+}
+
+/**
+ * `routr main --json`: the [main] config with any ROUTR_MAIN_* override.
+ * A routr that is missing or predates the command gives mainFromEnv()
+ * quietly (the widget and the stale-binary warning say so already); a
+ * config it rejects gives it with the error.
+ */
+export async function readMain(cwd: string): Promise<MainRead> {
+	const r = await runRoutr(["main", "--json"], cwd, 5000);
+	if (r.missing || /unknown command "main"/.test(r.stderr)) return { main: mainFromEnv() };
+	const main = r.code === 0 ? parseMain(r.stdout) : undefined;
+	if (main) return { main };
+	const said = r.stderr.trim().split("\n")[0]?.replace(/^routr main: /, "");
+	const why = r.code === 0 ? "routr main --json printed something unexpected" : said || `routr main exited ${r.code}`;
+	return { main: mainFromEnv(), error: why };
 }

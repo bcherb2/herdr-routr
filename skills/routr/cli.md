@@ -149,7 +149,10 @@ or cancelled.
 | `routr flow show\|start [NAME] --file F\|-` | a scratch flow: one from file F (`-` reads stdin), checked as a flow file is, for this command only. It is not in `flow list` and replaces no flow, even one of its name; NAME may be left out when F defines one flow. `start` keeps F as `flow.toml` in the chain's work directory. |
 | `routr roles` | roles as resolved from config: the harness, model (`default model`: the harness's own) and effort each picks now; the permissions a worker started without `--permissions` gets; the roles at low effort; and the models `--model` takes on each harness (from `internal/route`) |
 | `routr watch [--foreground]` | the watcher; normally started detached by other commands |
-| `routr doctor [--socket S]` | one line per check, with the next step for each problem: the repo and its state directory, config, whether this process can reach herdr (a sandbox that denies it fails only while no watcher runs), the watcher, each harness (installed and logged in; none ready fails), the registry (a set-aside corrupt one warns), whether `OPENROUTER_API_KEY` is set for judge steps (a warning), the caller, the permissions a worker gets without `--permissions`, and the build: a binary built by `install.sh` (which stamps its checkout as `main.srcDir`) warns when that checkout has commits since its revision under `cmd`, `internal`, `go.mod` or `go.sum`, since the skill, the Claude Code plugin and the Pi extension are read live from it and are then newer than the binary; a binary built with uncommitted changes warns too. Exit 1 if a check fails |
+| `routr config [init\|example]` | the config files routr reads (the user's, then the repo's) and whether each exists (`--json`: `{user, repo}`, each `{path, exists}`). `init` writes the user file, with every key commented out and explained, when there is none (`--json`: `{path, created}`); `example` prints that template |
+| `routr main` | the `[main]` settings with any `ROUTR_MAIN_*` override: how the main agent keeps its context small (see "[main]" under "Roles and config"). A setting it rejects, or keys that don't fit together, is an error that names them |
+| `routr fallback HARNESS:MODEL [--error MSG]` | the `[[fallback]]` rule for a model (see "[[fallback]]" under "Roles and config"): its number and the models its work moves to, in order; rule 0 and none when no rule matches. `--error MSG` adds whether MSG, the API error the model failed with, is one waiting won't fix (`lasting` in `--json`: credit, a 402, quota, a usage limit, a login), the same test the watcher uses before it retries a worker's turn. A front end asks this when its model fails |
+| `routr doctor [--socket S]` | one line per check, with the next step for each problem: the repo and its state directory, config, the `[main]` settings, the `[[fallback]]` rules (a rule an earlier one hides warns), whether this process can reach herdr (a sandbox that denies it fails only while no watcher runs), the watcher, each harness (installed and logged in; none ready fails), the registry (a set-aside corrupt one warns), whether `OPENROUTER_API_KEY` is set for judge steps (a warning), the caller, the permissions a worker gets without `--permissions`, and the build: a binary built by `install.sh` (which stamps its checkout as `main.srcDir`) warns when that checkout has commits since its revision under `cmd`, `internal`, `go.mod` or `go.sum`, since the skill, the Claude Code plugin and the Pi extension are read live from it and are then newer than the binary; a binary built with uncommitted changes warns too. Exit 1 if a check fails |
 | `routr version` | the git revision the binary was built from (`go build` stamps it), `+dirty` if it had uncommitted changes, the commit time, the Go version, and the checkout `install.sh` built it from. `--json`: `{revision, time, modified, go, src}`; `revision` is empty for a binary built outside a git checkout |
 | `routr hook --log FILE EVENT` | Claude's hook sink: appends `{ts, event, payload}` (the payload as Claude sent it) to FILE. A Claude worker's PermissionRequest hook runs it, see "Answering a question" |
 
@@ -527,8 +530,12 @@ permissions. What it does each tick is in the repo's
 
 ## Roles and config
 
-User config `$XDG_CONFIG_HOME/routr/config.toml`, merged under
-`<root>/.routr/config.toml` (repo wins per key):
+User config `$XDG_CONFIG_HOME/routr/config.toml` (else
+`~/.config/routr/config.toml`), merged under `<root>/.routr/config.toml`
+(repo wins per key). Both are optional: with neither, every key has its
+default. `install.sh` runs `routr config init`, which writes the user file
+the first time with every key commented out and explained; it never
+touches a file that exists. Some keys, with example values:
 
 ```toml
 permissions = "auto"            # for workers when --permissions isn't given; unset: the caller's mode
@@ -546,6 +553,20 @@ answer = "human"                # human, agent or jev; --answer and a flow step'
 fallback = "human"              # who answers when jev cannot decide: human or agent
 context = ["SPEC.md", "README.md"]  # project docs for agent and jev, relative to the repo root
 min_confidence = 0.8            # jev answers at or above it; above 0, at most 1
+
+[main]                          # the main agent's context (see "[main]" below); never a worker's
+context = "truncate"            # truncate, summarize or off
+at = 150000                     # compact once the context passes this many tokens after a turn; 0 = 150000, -1 = no limit
+keep_turns = 3                  # the last turns a compaction keeps as they are; 0 = 3, -1 = no limit
+keep_tokens = 40000             # at most this many tokens of them; 0 = 40000, -1 = no limit
+strip_reasoning = true          # drop earlier turns' reasoning from each request
+
+[[fallback]]                    # when a model runs out of credit or quota (see "[[fallback]]" below)
+from = ["*glm-5.3-flash", "*deepseek-v4-flash"]   # globs on harness:model
+to = ["pi:openrouter/deepseek/deepseek-v4.1-flash", "pi:openrouter/anthropic/claude-haiku-5.5"]
+[[fallback]]
+from = ["*opus*"]
+to = ["codex:gpt-6.1", "pi:openrouter/moonshotai/kimi-3"]
 
 [harness.claude]
 model = "sonnet"
@@ -604,6 +625,73 @@ what it takes. `answer` picks who answers.
 decided with"). `fallback` and `min_confidence` are for `jev`, and are
 read each time Jev decides a question: nothing sets them per run, and a
 change applies to the next question.
+
+**`[main]`** is for the main agent: the session that starts workers, never
+a worker (`ROUTR_ID` set). Its front end reads it at session start with
+`routr main --json`. `strip_reasoning` drops each earlier turn's reasoning
+from the model's requests (the Pi front end, Chat Completions models
+only: a provider such as DeepSeek bills resent reasoning as input).
+`context`, `at`, `keep_turns` and `keep_tokens` compact the context on a
+long run (the Pi front end; Claude Code and Codex compact on their own).
+Once a run ends with the context past `at` tokens, as Pi counts them
+with the system prompt, it is compacted before the next turn (not after
+the user interrupted it), and workers' news waits until that is done. `truncate` makes no
+model call. A note takes the place of the earlier conversation. It
+carries the session's first message word for word (re-read any file it
+names), what the user wrote since, the latest todo list, this session's
+routr workers, and where state lives (beads, git, routr). The last
+`keep_turns` turns follow as they were, at most `keep_tokens` of them
+(Pi's estimate, a token per 4 characters), cut where a turn starts. A
+latest turn over `keep_tokens` on its own keeps its last steps, and its
+first message goes in the note. `summarize` has Pi summarize instead,
+told to keep worker and bead IDs, branches and open decisions. Pi then
+keeps what its `compaction.keepRecentTokens` says, not `keep_turns` or
+`keep_tokens`. The compaction Pi starts itself near the model's window
+goes the same way, and `at = -1` leaves only that one. The user's own
+`/compact` stays Pi's summary, and `off` leaves Pi alone. Pi compacts
+nothing shorter than its `compaction.keepRecentTokens` of conversation
+(20000 by default, the system prompt not counted), so with a low `at` a
+cut can wait; the front end says so once. 0 or unset is the default and
+-1 no limit.
+`ROUTR_MAIN_CONTEXT`, `ROUTR_MAIN_AT`, `ROUTR_MAIN_KEEP_TURNS`,
+`ROUTR_MAIN_KEEP_TOKENS` and `ROUTR_MAIN_STRIP_REASONING` (1 or 0)
+override a key for one run. A value below -1 or an unknown `context` is a
+config error for every command, as in any section, and no override
+helps. Keys that don't fit together are checked only where they are read
+(`routr main`, `routr doctor`'s main line, the front end), after the
+overrides, so one can fix them for a run: unless `context = "off"`,
+`keep_turns` and `keep_tokens` both -1 (a cut would keep everything), or a
+`keep_tokens` not below `at` (the context would be over the limit again
+straight after each cut). A front end that can't read them uses the
+defaults with the `ROUTR_MAIN_*` overrides, and says why.
+
+**`[[fallback]]`** rules say where a model's work goes when the model
+fails in a way waiting won't fix: out of credit or quota, a usage limit,
+a login. `from` is a list of globs on `harness:model` (`*` any run of
+characters, `/` and `:` included; `?` one; case ignored), `to` the
+models to move to, in order, as `harness:model` (a Pi model is
+`pi:PROVIDER/ID`, with `:LEVEL` for a thinking level). The first rule
+whose `from` matches wins. Its `to` entries are tried in order, skipping
+any that can't be used now. A fallback that fails too moves on down the
+same list, never to its own rule, so an Opus chain doesn't drift to what
+a cheap model falls back to, and no chain loops. A model no rule matches
+stops, and the user is told: there is no catch-all unless you write
+`from = ["*"]`. A file that sets `[[fallback]]` replaces the rules of
+the file before it, as any list does. `routr fallback MODEL` shows the
+rule a model gets; `routr doctor` warns of a rule an earlier `*`, or the
+same glob, hides (not every overlap of globs).
+
+The Pi main agent follows them now. When its run ends in such an error,
+it moves to the next `pi:` entry that Pi knows and has a key for
+(another harness's model it skips, and says so), unless the user picked
+another model meanwhile. If the context would fill more than 80% of that
+model's window, it is truncated first, as `[main]` describes but to at
+most half the window, whatever `[main] context` says. It then carries on
+with a `[routr]` message naming the failure and the new model, and stays
+on that model for the session. With no rule, or the list spent, wakes
+are held until the user's next message, since each would fail the same
+way. Workers don't move yet (planned: a worker's work goes to a new
+worker on the fallback model).
 
 A worker's **permissions** are `--permissions`, else config
 `permissions`, else the caller's own mode, else `default`. routr knows

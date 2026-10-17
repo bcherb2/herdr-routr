@@ -100,9 +100,12 @@ Each repo keeps its state in `.routr/`. Only `config.toml` and `flows/` there
 are tracked by git. A per-repo watcher drives the workers and starts on demand,
 so no command runs past its `--timeout`.
 
-- **Config:** `~/.config/routr/config.toml` sets roles, harness defaults and
-  `[env]` for worker tabs. A repo's `.routr/config.toml` overrides it;
-  `routr roles` shows the result.
+- **Config:** `~/.config/routr/config.toml` sets roles, harness defaults,
+  `[env]` for worker tabs, how the main agent keeps its context small
+  (`[main]`) and where a model's work goes when it runs out (`[[fallback]]`).
+  `install.sh` writes it the first time with every key commented out and
+  explained (`routr config init`). A repo's `.routr/config.toml` overrides
+  it; `routr roles` shows the result.
 
 ### Slash commands
 

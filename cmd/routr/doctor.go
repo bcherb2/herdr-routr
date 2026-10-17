@@ -53,6 +53,16 @@ func (a *app) doctor(args []string) error {
 		add("config", "fail", err.Error(), "fix the file it names ("+files+")")
 	} else {
 		add("config", "ok", "loaded "+files+" (each optional)", "")
+		if m, err := cfg.MainAgent(a.getenv); err != nil {
+			add("main", "fail", err.Error(), "fix [main] in "+files+", or the ROUTR_MAIN_* variable it names")
+		} else {
+			add("main", "ok", mainSummary(m), "")
+		}
+		if s, warn := fallbackSummary(cfg); warn {
+			add("fallback", "warn", s, "reorder [[fallback]] in "+files+": the first rule that matches wins")
+		} else {
+			add("fallback", "ok", s, "")
+		}
 	}
 
 	a.checkBuild(add)

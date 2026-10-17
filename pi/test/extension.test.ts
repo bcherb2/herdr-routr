@@ -657,3 +657,403 @@ test("the skill it ships loads in Pi, with no diagnostics", async () => {
 	assert.deepEqual(diagnostics, [], "Pi drops a skill whose frontmatter it can't parse");
 	assert.deepEqual(skills.map((s) => s.name), ["routr"]);
 });
+
+test("the main agent strips earlier reasoning as routr main says: not for a worker, another API, or strip_reasoning false", async (t) => {
+	const keys = ["ROUTR_ID", "ROUTR_MAIN_STRIP_REASONING", "FAKE_ROUTR_MAIN", "ROUTR_BIN", "ROUTR_STATE_DIR"] as const;
+	const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+	t.after(() => {
+		for (const k of keys) saved[k] === undefined ? delete process.env[k] : (process.env[k] = saved[k]);
+	});
+	const cwd = mkdtempSync(join(tmpdir(), "routr-pi-main-"));
+	Object.assign(process.env, { ROUTR_BIN: fake, ROUTR_STATE_DIR: join(cwd, ".routr") });
+	const { default: routr } = await import("../src/index.ts");
+	const m = mockPi();
+	routr(m.pi as any);
+	const messages = [
+		{ role: "user", content: "go", timestamp: 0 },
+		{ role: "assistant", content: [{ type: "thinking", thinking: "old" }, { type: "text", text: "started 7" }], timestamp: 0 },
+		{ role: "custom", customType: "routr-wake", content: "[routr] worker 7 is done", display: true, timestamp: 0 },
+	];
+	/** a session started under env; what its first request carries, and what it told the user */
+	const session = async (env: Record<string, string>, api = "openai-completions") => {
+		for (const k of ["ROUTR_ID", "ROUTR_MAIN_STRIP_REASONING", "FAKE_ROUTR_MAIN"]) delete process.env[k];
+		Object.assign(process.env, env);
+		const u = mockCtx(cwd);
+		u.ctx.mode = "print"; // no polling
+		m.fire("session_start", { reason: "startup" }, u.ctx);
+		const out = await m.fire("context", { type: "context", messages }, { ...u.ctx, model: { api } })[0];
+		await new Promise((r) => setTimeout(r, 50)); // a warning is sent once routr main has answered
+		m.fire("session_shutdown", {}, u.ctx);
+		return { stripped: out?.messages?.[1].content.length === 1, notes: u.notes };
+	};
+
+	assert.deepEqual(await session({}), { stripped: true, notes: [] }, "routr main: the built-in [main]");
+	for (const api of ["openai-responses", "openai-codex-responses", "azure-openai-responses", "anthropic-messages"])
+		assert.equal((await session({}, api)).stripped, false, `${api}: Responses pairs tool calls with their reasoning; Anthropic ignores it`);
+	assert.equal((await session({ ROUTR_ID: "12" })).stripped, false, "a worker keeps its reasoning");
+	const off = JSON.stringify({ context: "truncate", at: 150000, keep_turns: 3, keep_tokens: 40000, strip_reasoning: false });
+	assert.equal((await session({ FAKE_ROUTR_MAIN: off })).stripped, false, "[main] strip_reasoning = false");
+
+	// A routr older than `routr main`: the defaults, with ROUTR_MAIN_STRIP_REASONING, and no extra warning.
+	assert.deepEqual(await session({ FAKE_ROUTR_MAIN: "old" }), { stripped: true, notes: [] });
+	assert.equal((await session({ FAKE_ROUTR_MAIN: "old", ROUTR_MAIN_STRIP_REASONING: "0" })).stripped, false);
+
+	// A config routr rejects: the defaults, and the user hears why.
+	const bad = await session({ FAKE_ROUTR_MAIN: "bad" });
+	assert.equal(bad.stripped, true);
+	assert.deepEqual(bad.notes, ['routr: main.context = "compact": use one of truncate, summarize, off; the main agent uses the [main] defaults']);
+});
+
+/** A session path for session_before_compact: four turns of the user's, oldest first. */
+function branchOf(...turns: string[]) {
+	let n = 0;
+	const entry = (message: object) => ({ type: "message", id: `e${++n}`, parentId: n > 1 ? `e${n - 1}` : null, timestamp: new Date(n * 1000).toISOString(), message });
+	return turns.flatMap((t) => [
+		entry({ role: "user", content: t, timestamp: n }),
+		entry({ role: "assistant", content: [{ type: "text", text: `${t}: done ${"x".repeat(400)}` }], stopReason: "stop", timestamp: n }),
+	]);
+}
+
+test("past [main] at, the main agent's context is cut once its run settles: no model call, and wakes wait for the cut", { timeout: 40_000 }, async (t) => {
+	const cwd = mkdtempSync(join(tmpdir(), "routr-pi-cut-"));
+	const main = JSON.stringify({ context: "truncate", at: 1000, keep_turns: 1, keep_tokens: 500, strip_reasoning: true });
+	const env = { ...process.env, ROUTR_STATE_DIR: join(cwd, ".routr"), FAKE_ROUTR_RUN_SECS: "2", PI_SESSION_ID: "S1" };
+	const keys = ["ROUTR_ID", "FAKE_ROUTR_MAIN"] as const;
+	const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+	t.after(() => {
+		for (const k of keys) saved[k] === undefined ? delete process.env[k] : (process.env[k] = saved[k]);
+	});
+	delete process.env.ROUTR_ID;
+	Object.assign(process.env, { ROUTR_BIN: fake, ROUTR_STATE_DIR: env.ROUTR_STATE_DIR, FAKE_ROUTR_RUN_SECS: "2", ROUTR_PI_WAKE: "mine", ROUTR_PI_VIEW: "cards", FAKE_ROUTR_MAIN: main });
+	execFileSync(fake, ["list"], { cwd, env }); // creates .routr/state
+
+	const { default: routr } = await import("../src/index.ts");
+	const m = mockPi();
+	routr(m.pi as any);
+	const u = mockCtx(cwd);
+	const branch = branchOf("Read .design/brief.md and carry it out.", "two", "three");
+	let tokens = 900;
+	const compacts: any[] = [];
+	Object.assign(u.ctx, {
+		getContextUsage: () => ({ tokens, contextWindow: 1_000_000, percent: 0 }),
+		hasPendingMessages: () => false,
+		compact: (o: any) => compacts.push(o),
+		sessionManager: { ...u.ctx.sessionManager, getBranch: () => branch },
+	});
+	t.after(() => m.fire("session_shutdown", {}, u.ctx));
+	const wakes = () => m.sent.filter((s) => s.message.customType === "routr-wake");
+	debug = () => `widget:\n${u.widgetText()}\nwakes: ${wakes().length}\nnotes: ${u.notes.join(" | ")}`;
+
+	m.fire("session_start", { reason: "startup" }, u.ctx);
+	await new Promise((r) => setTimeout(r, 300)); // the baseline snapshot
+	await Promise.all(m.fire("agent_settled", { type: "agent_settled" }, u.ctx));
+	assert.equal(compacts.length, 0, "under at");
+
+	m.fire("agent_start", {}, u.ctx);
+	execFileSync(fake, ["start", "--role", "review", "x"], { cwd, env, stdio: "ignore" });
+	m.fire("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] }, u.ctx);
+	tokens = 1200;
+	await Promise.all(m.fire("agent_settled", { type: "agent_settled" }, u.ctx));
+	assert.equal(compacts.length, 1);
+	assert.equal(compacts[0].customInstructions, undefined, "truncate: no summary");
+	assert.match(u.notes.join("\n"), /routr: the context is at 1200 tokens, past 1000; keeping the last turn/);
+	await Promise.all(m.fire("agent_settled", { type: "agent_settled" }, u.ctx));
+	assert.equal(compacts.length, 1, "one cut at a time");
+
+	// Pi runs the compaction it was asked for: routr answers it
+	const [answer] = await Promise.all(m.fire("session_before_compact", { reason: "manual", branchEntries: branch, preparation: { tokensBefore: 1200 } }, u.ctx));
+	assert.equal(answer.compaction.firstKeptEntryId, "e5", "the last turn");
+	assert.match(answer.compaction.summary, /began with this message \(re-read any file it names\):\n\nRead \.design\/brief\.md and carry it out\./);
+	assert.match(answer.compaction.summary, /#7 review — /, "this session's worker");
+
+	await until("7 done on its card", () => /7 review .* done/.test(u.widgetText()));
+	await new Promise((r) => setTimeout(r, 1500));
+	assert.equal(wakes().length, 0, "a wake turn now would race the cut");
+	compacts[0].onComplete({ tokensBefore: 1200, estimatedTokensAfter: 300 });
+	m.fire("session_compact", { reason: "manual", fromExtension: true }, u.ctx);
+	assert.match(u.notes.join("\n"), /routr: cut the context from 1200 to about 300 tokens/);
+	const wake = await until("the wake, once the cut is done", () => wakes()[0]);
+	assert.deepEqual(wake.message.details.entries.map((e: any) => e.id), [7]);
+});
+
+test("which compactions routr answers: Pi's own near the window, never the user's /compact or a worker's; summarize and off leave Pi's", async (t) => {
+	const keys = ["ROUTR_ID", "FAKE_ROUTR_MAIN", "ROUTR_BIN", "ROUTR_STATE_DIR"] as const;
+	const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+	t.after(() => {
+		for (const k of keys) saved[k] === undefined ? delete process.env[k] : (process.env[k] = saved[k]);
+	});
+	const cwd = mkdtempSync(join(tmpdir(), "routr-pi-cut-"));
+	Object.assign(process.env, { ROUTR_BIN: fake, ROUTR_STATE_DIR: join(cwd, ".routr") });
+	const { default: routr } = await import("../src/index.ts");
+	const m = mockPi();
+	routr(m.pi as any);
+	const branch = branchOf("brief", "a", "b", "c", "d");
+	const session = async (env: Record<string, string>, reason: string) => {
+		for (const k of ["ROUTR_ID", "FAKE_ROUTR_MAIN"]) delete process.env[k];
+		Object.assign(process.env, env);
+		const u = mockCtx(cwd);
+		u.ctx.mode = "print"; // no polling
+		const compacts: any[] = [];
+		Object.assign(u.ctx, {
+			getContextUsage: () => ({ tokens: 200_000, contextWindow: 1_000_000, percent: 20 }),
+			hasPendingMessages: () => false,
+			compact: (o: any) => compacts.push(o),
+			sessionManager: { ...u.ctx.sessionManager, getBranch: () => branch },
+		});
+		m.fire("session_start", { reason: "startup" }, u.ctx);
+		if (reason === "settled") await Promise.all(m.fire("agent_settled", { type: "agent_settled" }, u.ctx));
+		const [answer] = await Promise.all(m.fire("session_before_compact", { reason: reason === "settled" ? "manual" : reason, branchEntries: branch, preparation: { tokensBefore: 200_000 } }, u.ctx));
+		m.fire("session_shutdown", {}, u.ctx);
+		return { answer, compacts };
+	};
+	const main = (o: object) => JSON.stringify({ context: "truncate", at: 150000, keep_turns: 3, keep_tokens: 40000, strip_reasoning: true, ...o });
+
+	assert.equal((await session({}, "manual")).answer, undefined, "the user's /compact: Pi's summary");
+	for (const reason of ["threshold", "overflow"]) assert.equal((await session({}, reason)).answer.compaction.firstKeptEntryId, "e5", `Pi's ${reason} compaction, truncated`);
+	assert.equal((await session({}, "settled")).answer.compaction.firstKeptEntryId, "e5");
+	assert.equal((await session({ ROUTR_ID: "12" }, "threshold")).answer, undefined, "a worker's context is its work");
+	assert.equal((await session({ ROUTR_ID: "12" }, "settled")).compacts.length, 0);
+
+	const sum = await session({ FAKE_ROUTR_MAIN: main({ context: "summarize" }) }, "settled");
+	assert.match(sum.compacts[0].customInstructions, /Quote the session's first user message word for word/);
+	assert.equal(sum.answer, undefined, "summarize: Pi's summary");
+	const off = await session({ FAKE_ROUTR_MAIN: main({ context: "off" }) }, "settled");
+	assert.equal(off.compacts.length, 0);
+	assert.equal((await session({ FAKE_ROUTR_MAIN: main({ context: "off" }) }, "threshold")).answer, undefined, "off: Pi as it is");
+	// nothing older than the turns kept: no cut asked for; Pi's own goes on its way
+	const few = main({ keep_turns: -1, keep_tokens: 100_000, at: 150_000 });
+	assert.equal((await session({ FAKE_ROUTR_MAIN: few }, "settled")).compacts.length, 0);
+	assert.equal((await session({ FAKE_ROUTR_MAIN: few }, "threshold")).answer, undefined);
+});
+
+test("Pi refusing a cut for its keepRecentTokens is said once a session, with why", async (t) => {
+	const keys = ["ROUTR_ID", "FAKE_ROUTR_MAIN", "ROUTR_BIN", "ROUTR_STATE_DIR"] as const;
+	const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+	t.after(() => {
+		for (const k of keys) saved[k] === undefined ? delete process.env[k] : (process.env[k] = saved[k]);
+	});
+	const cwd = mkdtempSync(join(tmpdir(), "routr-pi-cut-"));
+	for (const k of ["ROUTR_ID", "FAKE_ROUTR_MAIN"]) delete process.env[k];
+	Object.assign(process.env, { ROUTR_BIN: fake, ROUTR_STATE_DIR: join(cwd, ".routr") });
+	const { default: routr } = await import("../src/index.ts");
+	const m = mockPi();
+	Object.assign(m.pi, { getSettings: () => ({ compaction: { keepRecentTokens: 30_000 } }) });
+	routr(m.pi as any);
+	const u = mockCtx(cwd);
+	u.ctx.mode = "print";
+	const branch = branchOf("brief", "a", "b", "c", "d");
+	let tokens = 200_000;
+	let tries = 0;
+	Object.assign(u.ctx, {
+		getContextUsage: () => ({ tokens, contextWindow: 1_000_000, percent: 20 }),
+		hasPendingMessages: () => false,
+		compact: (o: any) => (tries++, o.onError(new Error("Compaction failed: Nothing to compact (session too small)"))),
+		sessionManager: { ...u.ctx.sessionManager, getBranch: () => branch },
+	});
+	m.fire("session_start", { reason: "startup" }, u.ctx);
+	for (let i = 0; i < 3; i++) await Promise.all(m.fire("agent_settled", { type: "agent_settled" }, u.ctx));
+	assert.equal(tries, 1, "no retry until the context has grown");
+	tokens = 230_000;
+	await Promise.all(m.fire("agent_settled", { type: "agent_settled" }, u.ctx));
+	assert.equal(tries, 2, "a tenth more: try again");
+	m.fire("session_shutdown", {}, u.ctx);
+	const told = u.notes.filter((n) => /nothing to cut yet/.test(n));
+	assert.deepEqual(told, ["routr: nothing to cut yet: Pi always keeps the last 30000 tokens of conversation (compaction.keepRecentTokens), and [main] at counts the system prompt too"]);
+	assert.equal(u.notes.filter((n) => /the context is at/.test(n)).length, 1, "it tries after each turn, quietly: the conversation grows past it");
+});
+
+test("no cut right after the user interrupts a run, and a cut that throws still lets the wakes go", async (t) => {
+	const keys = ["ROUTR_ID", "FAKE_ROUTR_MAIN", "ROUTR_BIN", "ROUTR_STATE_DIR"] as const;
+	const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+	t.after(() => {
+		for (const k of keys) saved[k] === undefined ? delete process.env[k] : (process.env[k] = saved[k]);
+	});
+	const cwd = mkdtempSync(join(tmpdir(), "routr-pi-cut-"));
+	delete process.env.ROUTR_ID;
+	Object.assign(process.env, {
+		ROUTR_BIN: fake,
+		ROUTR_STATE_DIR: join(cwd, ".routr"),
+		FAKE_ROUTR_MAIN: JSON.stringify({ context: "summarize", at: 150000, keep_turns: 3, keep_tokens: 40000, strip_reasoning: true }),
+	});
+	const { default: routr } = await import("../src/index.ts");
+	const m = mockPi();
+	routr(m.pi as any);
+	const u = mockCtx(cwd);
+	u.ctx.mode = "print";
+	const compacts: any[] = [];
+	let broken = false;
+	const branch = branchOf("brief", "a", "b", "c", "d");
+	Object.assign(u.ctx, {
+		getContextUsage: () => ({ tokens: 200_000, contextWindow: 1_000_000, percent: 20 }),
+		hasPendingMessages: () => false,
+		compact: (o: any) => compacts.push(o),
+		sessionManager: {
+			...u.ctx.sessionManager,
+			getBranch: () => {
+				if (broken) throw new Error("bad branch");
+				return branch;
+			},
+		},
+	});
+	m.fire("session_start", { reason: "startup" }, u.ctx);
+	m.fire("agent_end", { messages: [{ role: "assistant", stopReason: "aborted" }] }, u.ctx);
+	await Promise.all(m.fire("agent_settled", { type: "agent_settled" }, u.ctx));
+	assert.equal(compacts.length, 0, "Esc: they are about to type");
+	m.fire("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] }, u.ctx);
+	broken = true;
+	await Promise.all(m.fire("agent_settled", { type: "agent_settled" }, u.ctx));
+	assert.equal(compacts.length, 0);
+	assert.match(u.notes.at(-1)!, /routr: could not cut the context: bad branch/);
+	broken = false;
+	await Promise.all(m.fire("agent_settled", { type: "agent_settled" }, u.ctx));
+	assert.equal(compacts.length, 1, "not stuck compacting: the next settle cuts");
+	m.fire("session_shutdown", {}, u.ctx);
+});
+
+/** A main-agent session whose model, registry and compaction the test controls. */
+async function fallbackSession(t: any, env: Record<string, string>) {
+	const keys = ["ROUTR_ID", "FAKE_ROUTR_MAIN", "FAKE_ROUTR_FALLBACK", "ROUTR_BIN", "ROUTR_STATE_DIR"] as const;
+	const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+	t.after(() => {
+		for (const k of keys) saved[k] === undefined ? delete process.env[k] : (process.env[k] = saved[k]);
+	});
+	const cwd = mkdtempSync(join(tmpdir(), "routr-pi-fallback-"));
+	for (const k of ["ROUTR_ID", "FAKE_ROUTR_MAIN", "FAKE_ROUTR_FALLBACK"]) delete process.env[k];
+	Object.assign(process.env, { ROUTR_BIN: fake, ROUTR_STATE_DIR: join(cwd, ".routr"), ...env });
+	const models: Record<string, any> = {
+		"deepseek/deepseek-v4-pro": { provider: "deepseek", id: "deepseek-v4-pro", contextWindow: 1_000_000 },
+		"openrouter/nokey": { provider: "openrouter", id: "nokey", contextWindow: 200_000, noKey: true },
+		"openrouter/anthropic/claude-haiku-5.5": { provider: "openrouter", id: "anthropic/claude-haiku-5.5", contextWindow: 200_000 },
+		"openrouter/deepseek/deepseek-v4.1-flash": { provider: "openrouter", id: "deepseek/deepseek-v4.1-flash", contextWindow: 1_000_000 },
+		"openrouter/tiny": { provider: "openrouter", id: "tiny", contextWindow: 200 },
+	};
+	const { default: routr } = await import("../src/index.ts");
+	const m = mockPi();
+	let model = models["deepseek/deepseek-v4-pro"];
+	const thinking: string[] = [];
+	Object.assign(m.pi, {
+		setModel: async (x: any) => ((model = x), true),
+		setThinkingLevel: (l: string) => thinking.push(l),
+		getSettings: () => ({}),
+	});
+	routr(m.pi as any);
+	const u = mockCtx(cwd);
+	u.ctx.mode = "print";
+	const compacts: any[] = [];
+	let tokens = 50_000;
+	Object.defineProperty(u.ctx, "model", { get: () => model });
+	Object.assign(u.ctx, {
+		modelRegistry: { find: (p: string, id: string) => models[`${p}/${id}`], hasConfiguredAuth: (x: any) => !x.noKey },
+		getContextUsage: () => ({ tokens, contextWindow: 1_000_000, percent: 5 }),
+		hasPendingMessages: () => false,
+		compact: (o: any) => compacts.push(o),
+		sessionManager: { ...u.ctx.sessionManager, getBranch: () => branchOf("brief", "a", "b", "c", "d") },
+	});
+	m.fire("session_start", { reason: "startup" }, u.ctx);
+	t.after(() => m.fire("session_shutdown", {}, u.ctx));
+	/** a run that ended in `error` (none: it answered) on `on` (default: the model in use), then settled */
+	const runEnds = async (error?: string, on?: { provider: string; id: string }) => {
+		m.fire("agent_start", {}, u.ctx);
+		const by = on ?? model;
+		const last =
+			error === undefined ? { role: "assistant", stopReason: "stop" } : { role: "assistant", stopReason: "error", errorMessage: error, provider: by.provider, model: by.id };
+		m.fire("agent_end", { messages: [{ role: "user" }, last] }, u.ctx);
+		await Promise.all(m.fire("agent_settled", { type: "agent_settled" }, u.ctx));
+	};
+	const resent = () => m.sent.filter((s) => s.message.customType === "routr-fallback");
+	return { m, u, runEnds, resent, compacts, thinking, models, model: () => model, setModel: (x: any) => (model = x), setTokens: (n: number) => (tokens = n) };
+}
+
+const BALANCE = '402: {"message":"Insufficient Balance (request_id: 88fc6ff6)","type":"unknown_error"}';
+const RULES = JSON.stringify({
+	"pi:deepseek/deepseek-v4-pro": ["codex:gpt-6.1", "pi:openrouter/nokey", "pi:openrouter/anthropic/claude-haiku-5.5", "pi:openrouter/deepseek/deepseek-v4.1-flash:high"],
+});
+
+test("a main agent out of credit moves down its [[fallback]] rule and carries on; a fallback that fails too goes on down the same list", async (t) => {
+	const s = await fallbackSession(t, { FAKE_ROUTR_FALLBACK: RULES });
+	await s.runEnds(BALANCE);
+	assert.equal(s.model().id, "anthropic/claude-haiku-5.5");
+	assert.match(s.u.notes.at(-1)!, /^routr: pi:deepseek\/deepseek-v4-pro failed \(402: .*Insufficient Balance.*\); switched to pi:openrouter\/anthropic\/claude-haiku-5\.5, \[\[fallback\]\] rule 1 \(skipped codex:gpt-6\.1: not a Pi model; pi:openrouter\/nokey: no API key in Pi\)$/);
+	assert.equal(s.resent().length, 1);
+	assert.deepEqual(s.resent()[0]!.options, { triggerTurn: true, deliverAs: "followUp" });
+	assert.match(s.resent()[0]!.message.content, /^\[routr\] Your last turn failed on pi:deepseek\/deepseek-v4-pro: 402: .*You are now on pi:openrouter\/anthropic\/claude-haiku-5\.5 \(\[\[fallback\]\] rule 1\)\. Carry on where you left off\.$/);
+	assert.equal(s.compacts.length, 0, "50k fits haiku's window");
+
+	await s.runEnds("Overloaded");
+	assert.equal(s.model().id, "anthropic/claude-haiku-5.5", "an error that may pass: Pi's own retry, no move");
+
+	await s.runEnds("429 quota exceeded");
+	assert.equal(s.model().id, "deepseek/deepseek-v4.1-flash", "haiku failed too: the next of the original list");
+	assert.deepEqual(s.thinking, ["high"]);
+
+	await s.runEnds(BALANCE);
+	assert.equal(s.resent().length, 2, "the list is spent: nothing resent");
+	assert.match(s.u.notes.at(-1)!, /^routr: pi:openrouter\/deepseek\/deepseek-v4\.1-flash failed \(402: .*\), and no model of \[\[fallback\]\] rule 1 is left to take over\. Wakes wait until your next message; \/model switches by hand\.$/);
+	await s.runEnds(BALANCE);
+	assert.equal(s.u.notes.filter((n) => /is left to take over/.test(n)).length, 2, "the user's own next turn failed too: said again");
+});
+
+test("no [[fallback]] rule: the main agent stops and says so; a routr without the command leaves Pi as it is", async (t) => {
+	const s = await fallbackSession(t, {});
+	await s.runEnds(BALANCE);
+	assert.equal(s.model().id, "deepseek-v4-pro");
+	assert.match(s.u.notes.at(-1)!, /^routr: pi:deepseek\/deepseek-v4-pro failed \(402: .*\), and no \[\[fallback\]\] rule matches it\. Wakes wait/);
+	assert.equal(s.resent().length, 0);
+	const old = await fallbackSession(t, { FAKE_ROUTR_FALLBACK: "old" });
+	await old.runEnds(BALANCE);
+	assert.equal(old.model().id, "deepseek-v4-pro");
+	assert.deepEqual(old.u.notes, []);
+	const worker = await fallbackSession(t, { FAKE_ROUTR_FALLBACK: RULES, ROUTR_ID: "12" });
+	await worker.runEnds(BALANCE);
+	assert.equal(worker.model().id, "deepseek-v4-pro", "a worker's model is routr's to change, not its own");
+});
+
+test("a fallback model whose window the context would fill gets it truncated first, whatever [main] context says, then carries on", async (t) => {
+	const main = JSON.stringify({ context: "summarize", at: 500000, keep_turns: 3, keep_tokens: 40000, strip_reasoning: true });
+	const s = await fallbackSession(t, { FAKE_ROUTR_FALLBACK: RULES, FAKE_ROUTR_MAIN: main });
+	s.setTokens(170_000); // over 80% of haiku's 200k
+	await s.runEnds(BALANCE);
+	assert.equal(s.model().id, "anthropic/claude-haiku-5.5");
+	assert.equal(s.compacts.length, 1);
+	assert.equal(s.resent().length, 0, "not before the cut");
+	const [answer] = await Promise.all(s.m.fire("session_before_compact", { reason: "manual", branchEntries: branchOf("brief", "a", "b", "c", "d"), preparation: { tokensBefore: 170_000 } }, s.u.ctx));
+	assert.equal(answer.compaction.firstKeptEntryId, "e5", "truncated, though [main] says summarize");
+	s.compacts[0].onComplete({ tokensBefore: 170_000, estimatedTokensAfter: 30_000 });
+	assert.equal(s.resent().length, 1, "then on");
+	const [after] = await Promise.all(s.m.fire("session_before_compact", { reason: "threshold", branchEntries: branchOf("brief", "a", "b", "c", "d"), preparation: { tokensBefore: 170_000 } }, s.u.ctx));
+	assert.equal(after, undefined, "later compactions are [main]'s again");
+});
+
+test("the fallback leaves a model the user switched to, skips the model that failed, and says once when routr rejects the rules", async (t) => {
+	const s = await fallbackSession(t, { FAKE_ROUTR_FALLBACK: JSON.stringify({ "pi:deepseek/deepseek-v4-pro": ["pi:deepseek/deepseek-v4-pro:high", "pi:openrouter/anthropic/claude-haiku-5.5"] }) });
+	const pro = s.model();
+	s.setModel(s.models["openrouter/deepseek/deepseek-v4.1-flash"]); // the user's /model while pro's run was failing
+	await s.runEnds(BALANCE, pro);
+	assert.equal(s.model().id, "deepseek/deepseek-v4.1-flash", "theirs to try");
+	assert.equal(s.resent().length, 0);
+	s.setModel(pro);
+	await s.runEnds(BALANCE);
+	assert.equal(s.model().id, "anthropic/claude-haiku-5.5");
+	assert.match(s.u.notes.at(-1)!, /\(skipped pi:deepseek\/deepseek-v4-pro:high: the model that failed\)$/);
+
+	const bad = await fallbackSession(t, { FAKE_ROUTR_FALLBACK: "{not json" });
+	await bad.runEnds(BALANCE);
+	await bad.runEnds(BALANCE);
+	assert.equal(bad.u.notes.filter((n) => /^routr: no model fallback: /.test(n)).length, 1, "said once");
+	assert.equal(bad.model().id, "deepseek-v4-pro");
+});
+
+test("a forced cut keeps at most half the new window, though [main] keeps everything, and says so if the context still won't fit", async (t) => {
+	const main = JSON.stringify({ context: "off", at: -1, keep_turns: -1, keep_tokens: -1, strip_reasoning: true });
+	const s = await fallbackSession(t, { FAKE_ROUTR_FALLBACK: JSON.stringify({ "pi:deepseek/deepseek-v4-pro": ["pi:openrouter/tiny"] }), FAKE_ROUTR_MAIN: main });
+	s.setTokens(170); // over 80% of tiny's 200
+	await s.runEnds(BALANCE);
+	assert.equal(s.model().id, "tiny");
+	const [answer] = await Promise.all(s.m.fire("session_before_compact", { reason: "manual", branchEntries: branchOf("brief", "a", "b"), preparation: { tokensBefore: 170 } }, s.u.ctx));
+	assert.ok(answer?.compaction, "a cut, where [main] alone would keep everything");
+	assert.equal(answer.compaction.details.split, true, "100 tokens: not even the last turn whole");
+	s.setTokens(250);
+	s.compacts[0].onComplete({ tokensBefore: 170, estimatedTokensAfter: 250 });
+	assert.match(s.u.notes.join("\n"), /routr: the context \(250 tokens\) is still over pi:openrouter\/tiny's window of 200; Pi's overflow compaction takes it from here/);
+	assert.equal(s.resent().length, 1, "carried on all the same");
+});

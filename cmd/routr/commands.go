@@ -1161,3 +1161,151 @@ func yesDash(b bool) string {
 	}
 	return "-"
 }
+
+// mainAgent prints the [main] settings: how the main agent, the session that
+// starts workers, keeps its context small. Its front end reads them with
+// --json.
+func (a *app) mainAgent(args []string) error {
+	fs, c := a.flags("main")
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	p, err := a.paths(c)
+	if err != nil {
+		return err
+	}
+	cfg, err := a.loadConfig(p)
+	if err != nil {
+		return err
+	}
+	m, err := cfg.MainAgent(a.getenv)
+	if err != nil {
+		return err
+	}
+	if c.json {
+		return a.printJSON(m)
+	}
+	limit := func(n int, unit string) string {
+		if n == config.Unlimited {
+			return "no limit"
+		}
+		return strings.TrimSpace(fmt.Sprintf("%d %s", n, unit))
+	}
+	tw := tabwriter.NewWriter(a.stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintf(tw, "context\t%s\n", m.Context)
+	fmt.Fprintf(tw, "at\t%s\n", limit(m.At, "tokens"))
+	fmt.Fprintf(tw, "keep_turns\t%s\n", limit(m.KeepTurns, ""))
+	fmt.Fprintf(tw, "keep_tokens\t%s\n", limit(m.KeepTokens, "tokens"))
+	fmt.Fprintf(tw, "strip_reasoning\t%s\n", map[bool]string{true: "on", false: "off"}[m.StripReasoning])
+	return tw.Flush()
+}
+
+// fallbackOut is `routr fallback --json`: rule 0 and an empty to when no
+// rule matches; lasting only with --error.
+type fallbackOut struct {
+	Model   string   `json:"model"`
+	Rule    int      `json:"rule"`
+	From    []string `json:"from"`
+	To      []string `json:"to"`
+	Lasting *bool    `json:"lasting,omitempty"`
+}
+
+// fallback prints the [[fallback]] rule for a model, and with --error
+// whether that error moves it there. A front end asks it when its model
+// fails.
+func (a *app) fallback(args []string) error {
+	fs, c := a.flags("fallback")
+	errMsg := fs.String("error", "", "the API error the model failed with: say whether waiting won't fix it (then its work moves on)")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return usagef("routr fallback HARNESS:MODEL: name one model, as harness:model")
+	}
+	model := pos[0]
+	if h, m, ok := strings.Cut(model, ":"); !ok || !slices.Contains(config.Harnesses, h) || m == "" {
+		return usagef("%q: use harness:model (harnesses: %s)", model, strings.Join(config.Harnesses, ", "))
+	}
+	p, err := a.paths(c)
+	if err != nil {
+		return err
+	}
+	cfg, err := a.loadConfig(p)
+	if err != nil {
+		return err
+	}
+	n, rule := cfg.FallbackFor(model)
+	out := fallbackOut{Model: model, Rule: n, From: rule.From, To: rule.To}
+	if out.To == nil {
+		out.From, out.To = []string{}, []string{}
+	}
+	if *errMsg != "" {
+		out.Lasting = new(watch.Lasting(*errMsg))
+	}
+	if c.json {
+		return a.printJSON(out)
+	}
+	if out.Lasting != nil {
+		if *out.Lasting {
+			fmt.Fprintln(a.stdout, "error: waiting won't fix it; move to the next model")
+		} else {
+			fmt.Fprintln(a.stdout, "error: it may pass; it is retried, not moved")
+		}
+	}
+	if n == 0 {
+		fmt.Fprintf(a.stdout, "%s: no [[fallback]] rule matches; a failure that waiting won't fix stops it\n", model)
+		return nil
+	}
+	fmt.Fprintf(a.stdout, "%s: rule %d (from %s)\n", model, n, strings.Join(rule.From, ", "))
+	for i, m := range rule.To {
+		fmt.Fprintf(a.stdout, "  %d  %s\n", i+1, m)
+	}
+	return nil
+}
+
+// fallbackSummary is doctor's line for the [[fallback]] rules, and whether it warns.
+func fallbackSummary(c config.Config) (string, bool) {
+	if len(c.Fallback) == 0 {
+		return "no [[fallback]] rules: a model that runs out of credit or quota stops", false
+	}
+	s := fmt.Sprintf("%d rules", len(c.Fallback))
+	if len(c.Fallback) == 1 {
+		s = "1 rule"
+	}
+	shadowed := c.ShadowedFallbacks()
+	for _, n := range shadowed {
+		s += fmt.Sprintf("; rule %d never matches: an earlier rule catches all it would", n)
+	}
+	return s, len(shadowed) > 0
+}
+
+// mainSummary is doctor's line for the [main] settings.
+func mainSummary(m config.MainAgent) string {
+	var s string
+	switch {
+	case m.Context == "off":
+		s = "no compaction of ours"
+	case m.At == config.Unlimited:
+		s = m.Context + " only when Pi nears the model's window"
+	default:
+		s = fmt.Sprintf("%s at %d tokens", m.Context, m.At)
+	}
+	if m.Context == "summarize" {
+		s += ", by Pi's summary, which keeps what its compaction.keepRecentTokens says"
+	}
+	if m.Context == "truncate" {
+		switch {
+		case m.KeepTurns == config.Unlimited:
+			s += fmt.Sprintf(", keeping up to %d tokens of the latest turns", m.KeepTokens)
+		case m.KeepTokens == config.Unlimited:
+			s += fmt.Sprintf(", keeping the last %d turns", m.KeepTurns)
+		default:
+			s += fmt.Sprintf(", keeping the last %d turns up to %d tokens", m.KeepTurns, m.KeepTokens)
+		}
+	}
+	if m.StripReasoning {
+		return s + "; earlier turns' reasoning stripped"
+	}
+	return s + "; earlier turns' reasoning kept"
+}

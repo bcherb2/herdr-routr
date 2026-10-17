@@ -31,6 +31,13 @@
 //   show ID [--focus] → "ok: show ID"
 //   version --json → the revision in FAKE_ROUTR_REV ("old": a routr without
 //                the version command, which exits 2)
+//   main --json → FAKE_ROUTR_MAIN as given (default: the built-in [main]);
+//                FAKE_ROUTR_MAIN=old: a routr without the main command (exit
+//                2), =bad: a config it rejects (exit 1)
+//   fallback MODEL --error MSG --json → FAKE_ROUTR_FALLBACK, a JSON object
+//                {model: [to…]} (default {}), as rule 1, 2, … in key order;
+//                lasting when MSG says credit, balance, 402 or quota;
+//                FAKE_ROUTR_FALLBACK=old: a routr without the command (exit 2)
 //   start and flow start take --answer human|agent|jev (default human),
 //                recorded on each worker as answerer
 //   cancel ID|CHAIN → like the CLI: says "routr: cancelled ID …" per worker it
@@ -351,6 +358,33 @@ switch (cmd) {
 			process.exit(2);
 		}
 		console.log(JSON.stringify({ revision: rev, modified: false, go: "go1.26.7" }));
+		break;
+	}
+	case "main": {
+		const m = process.env.FAKE_ROUTR_MAIN || "";
+		if (m === "old") {
+			console.error(`routr: unknown command "main"; run routr help`);
+			process.exit(2);
+		}
+		if (m === "bad") {
+			console.error(`routr main: main.context = "compact": use one of truncate, summarize, off`);
+			process.exit(1);
+		}
+		console.log(m || JSON.stringify({ context: "truncate", at: 150000, keep_turns: 3, keep_tokens: 40000, strip_reasoning: true }));
+		break;
+	}
+	case "fallback": {
+		const f = process.env.FAKE_ROUTR_FALLBACK || "{}";
+		if (f === "old") {
+			console.error(`routr: unknown command "fallback"; run routr help`);
+			process.exit(2);
+		}
+		const rules = Object.entries(JSON.parse(f));
+		const n = rules.findIndex(([m]) => m === arg1);
+		const msg = flag(args, "--error");
+		const out = { model: arg1, rule: n + 1, from: n < 0 ? [] : [arg1], to: n < 0 ? [] : rules[n][1] };
+		if (msg !== undefined) out.lasting = /credit|balance|402|quota/i.test(msg) && !/try again/i.test(msg);
+		console.log(JSON.stringify(out));
 		break;
 	}
 	case "answer": {

@@ -26,6 +26,12 @@ import (
 //go:embed builtin.toml
 var builtin string
 
+// Example is a user config with every key commented out and explained:
+// what `routr config init` writes and `routr config example` prints.
+//
+//go:embed example.toml
+var Example string
+
 // Config is the merged configuration.
 type Config struct {
 	Permissions string             `toml:"permissions"` // default for workers: default, auto or bypass; "" = unset
@@ -34,6 +40,8 @@ type Config struct {
 	Roles       map[string]Role    `toml:"roles"`
 	Registry    Registry           `toml:"registry"`
 	Questions   Questions          `toml:"questions"`
+	Main        Main               `toml:"main"`
+	Fallback    []Fallback         `toml:"fallback"` // [[fallback]] rules, first match wins; a file that sets any replaces the rules before it
 
 	// StartMCPServers lets workers start the user's MCP servers and
 	// claude.ai connectors; false (built in) starts them with none.
@@ -203,6 +211,10 @@ func (c Config) validate() error {
 		errs = append(errs, fmt.Errorf("permissions = %q: use one of %s", c.Permissions, strings.Join(Permissions, ", ")))
 	}
 	errs = append(errs, c.Questions.validate()...)
+	errs = append(errs, c.Main.validate()...)
+	for i, f := range c.Fallback {
+		errs = append(errs, f.validate(i+1)...)
+	}
 	for h, hc := range c.Harness {
 		if err := checkEffort(h, hc.Effort); err != nil {
 			errs = append(errs, fmt.Errorf("harness.%s.effort: %w", h, err))

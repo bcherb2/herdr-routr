@@ -123,24 +123,27 @@ type command struct {
 }
 
 var commands = map[string]command{
-	"start":   {(*app).start, "routr start [--role R] [--title T] [--harness H] [--model M] [--effort E] [--permissions P] [--answer A] [--cwd D] [--output F] [--interactive] [--after ID|-]… [--gate you] [--chain C] [--step S] [--param k=v]… [--in F] [--wait] [--timeout T] BRIEF|- | --run CMD [--expect pass|fail] [--run-timeout 10m]", "Queue a worker: a harness in a new herdr tab, working on BRIEF (the text, or - to read it from stdin); or with --run, a shell command whose exit status is its verdict. Prints its id; --wait also waits for it. routr roles lists the roles."},
-	"wait":    {(*app).wait, "routr wait ID|CHAIN|- [--timeout 9m]", "Wait for worker ID, or every worker of chain CHAIN (- reads the id from stdin), and print its final message. Exit 3: still running; run it again."},
-	"result":  {(*app).result, "routr result ID [--path]", "Print worker ID's final message, then output: and verdict: lines. --path prints only the path of the file holding it."},
-	"send":    {(*app).send, "routr send ID TEXT|- [--wait] [--timeout 9m]", "Send worker ID a follow-up, TEXT (- reads stdin), in the same session; a closed tab is reopened."},
-	"done":    {(*app).done, "routr done [--output F] [--verdict pass|fail] [--id N] MESSAGE|-", "Run by a worker, not by you: record that it finished, with MESSAGE (- reads stdin), the file it wrote and a verdict."},
-	"list":    {(*app).list, "routr list [--all] [--since 1h] [--final]", "List the workers that are active, have a tab, or finished in the last hour: id, title, role, harness, state, output."},
-	"show":    {(*app).show, "routr show ID [--focus] | show ID --context", "Put worker ID's tab beside your herdr pane, so the user can watch it or talk to it. --context instead prints what its question is decided with: the question, the tool call it is about, its brief, and the project docs to read."},
-	"hide":    {(*app).hide, "routr hide ID", "Put worker ID's pane back into its own tab (undoes show)."},
-	"close":   {(*app).closeCmd, "routr close ID", "Close worker ID's tab, which stops a worker still at work. Its session stays: routr send resumes it."},
-	"approve": {(*app).approve, "routr approve ID|CHAIN", "Open the gate of worker ID, or of chain CHAIN, so it starts; or accept a review loop that hit its cap. Only when the user says so."},
-	"answer":  {(*app).answer, "routr answer ID N [--expect FP] [--by human|agent|jev]", "Choose option N, numbered as on screen, of the question blocked worker ID is asking: the user's choice (--by human), or yours (--by agent) when routr says you answer it. --expect FP presses nothing if the question changed; --by agent or jev needs it, and never picks an option that saves a rule."},
-	"retry":   {(*app).retry, "routr retry ID|CHAIN", "Start failed worker ID, or every failed worker of chain CHAIN, again in its place: the same id, chain and step, so the workers after it wait on it as before. One that never started gets its brief again; one that ran is rerun in its session."},
-	"cancel":  {(*app).cancel, "routr cancel ID|CHAIN", "Stop worker ID, or every worker of chain CHAIN, and close its tab. Workers queued after it then can't start."},
-	"flow":    {(*app).flow, "routr flow list | show NAME [--toml] | start NAME [--task T] [--in F] [--param k=v]… [--harness H [--model M]] [--effort E] [--permissions P] [--answer A] [--env K=V]… [--cwd D] [--chain C] [--wait] | show|start [NAME] --file F|-", "Named multi-step flows: list names them, show NAME gives its steps and params (--toml: as written), start NAME runs it. --file runs a flow from a file or stdin for that start only."},
-	"roles":   {(*app).roles, "routr roles", "Show each role and the harness, model and effort it picks now."},
-	"watch":   {(*app).watchCmd, "routr watch [--foreground]", "Start the repo's watcher, which drives the workers. Other commands start it when needed."},
-	"doctor":  {(*app).doctor, "routr doctor [--socket S]", "Check what routr needs (herdr, harnesses, config, registry, whether this binary is current), with the next step for each problem. Exit 1 if a check fails."},
-	"version": {(*app).version, "routr version", "Print the git revision this binary was built from, whether it had uncommitted changes, and the checkout install.sh built it from."},
+	"start":    {(*app).start, "routr start [--role R] [--title T] [--harness H] [--model M] [--effort E] [--permissions P] [--answer A] [--cwd D] [--output F] [--interactive] [--after ID|-]… [--gate you] [--chain C] [--step S] [--param k=v]… [--in F] [--wait] [--timeout T] BRIEF|- | --run CMD [--expect pass|fail] [--run-timeout 10m]", "Queue a worker: a harness in a new herdr tab, working on BRIEF (the text, or - to read it from stdin); or with --run, a shell command whose exit status is its verdict. Prints its id; --wait also waits for it. routr roles lists the roles."},
+	"wait":     {(*app).wait, "routr wait ID|CHAIN|- [--timeout 9m]", "Wait for worker ID, or every worker of chain CHAIN (- reads the id from stdin), and print its final message. Exit 3: still running; run it again."},
+	"result":   {(*app).result, "routr result ID [--path]", "Print worker ID's final message, then output: and verdict: lines. --path prints only the path of the file holding it."},
+	"send":     {(*app).send, "routr send ID TEXT|- [--wait] [--timeout 9m]", "Send worker ID a follow-up, TEXT (- reads stdin), in the same session; a closed tab is reopened."},
+	"done":     {(*app).done, "routr done [--output F] [--verdict pass|fail] [--id N] MESSAGE|-", "Run by a worker, not by you: record that it finished, with MESSAGE (- reads stdin), the file it wrote and a verdict."},
+	"list":     {(*app).list, "routr list [--all] [--since 1h] [--final]", "List the workers that are active, have a tab, or finished in the last hour: id, title, role, harness, state, output."},
+	"show":     {(*app).show, "routr show ID [--focus] | show ID --context", "Put worker ID's tab beside your herdr pane, so the user can watch it or talk to it. --context instead prints what its question is decided with: the question, the tool call it is about, its brief, and the project docs to read."},
+	"hide":     {(*app).hide, "routr hide ID", "Put worker ID's pane back into its own tab (undoes show)."},
+	"close":    {(*app).closeCmd, "routr close ID", "Close worker ID's tab, which stops a worker still at work. Its session stays: routr send resumes it."},
+	"approve":  {(*app).approve, "routr approve ID|CHAIN", "Open the gate of worker ID, or of chain CHAIN, so it starts; or accept a review loop that hit its cap. Only when the user says so."},
+	"answer":   {(*app).answer, "routr answer ID N [--expect FP] [--by human|agent|jev]", "Choose option N, numbered as on screen, of the question blocked worker ID is asking: the user's choice (--by human), or yours (--by agent) when routr says you answer it. --expect FP presses nothing if the question changed; --by agent or jev needs it, and never picks an option that saves a rule."},
+	"retry":    {(*app).retry, "routr retry ID|CHAIN", "Start failed worker ID, or every failed worker of chain CHAIN, again in its place: the same id, chain and step, so the workers after it wait on it as before. One that never started gets its brief again; one that ran is rerun in its session."},
+	"cancel":   {(*app).cancel, "routr cancel ID|CHAIN", "Stop worker ID, or every worker of chain CHAIN, and close its tab. Workers queued after it then can't start."},
+	"flow":     {(*app).flow, "routr flow list | show NAME [--toml] | start NAME [--task T] [--in F] [--param k=v]… [--harness H [--model M]] [--effort E] [--permissions P] [--answer A] [--env K=V]… [--cwd D] [--chain C] [--wait] | show|start [NAME] --file F|-", "Named multi-step flows: list names them, show NAME gives its steps and params (--toml: as written), start NAME runs it. --file runs a flow from a file or stdin for that start only."},
+	"roles":    {(*app).roles, "routr roles", "Show each role and the harness, model and effort it picks now."},
+	"main":     {(*app).mainAgent, "routr main", "Show how the main agent (the session that starts workers, never a worker) keeps its context small: the [main] config section with any ROUTR_MAIN_* override. Its front end reads it with --json."},
+	"fallback": {(*app).fallback, "routr fallback HARNESS:MODEL [--error MSG]", "Show the [[fallback]] rule for a model: the models its work moves to, in order, when it fails in a way waiting won't fix. --error says whether MSG, the API error it failed with, is one. A front end asks this when its model fails."},
+	"config":   {(*app).configCmd, "routr config [init|example]", "List the config files routr reads (yours, then the repo's) and whether each exists. init writes yours, with every key commented out and explained, when you have none; example prints that template."},
+	"watch":    {(*app).watchCmd, "routr watch [--foreground]", "Start the repo's watcher, which drives the workers. Other commands start it when needed."},
+	"doctor":   {(*app).doctor, "routr doctor [--socket S]", "Check what routr needs (herdr, harnesses, config, registry, whether this binary is current), with the next step for each problem. Exit 1 if a check fails."},
+	"version":  {(*app).version, "routr version", "Print the git revision this binary was built from, whether it had uncommitted changes, and the checkout install.sh built it from."},
 }
 
 // examples are shown by `routr CMD --help`.
@@ -157,11 +160,14 @@ var examples = map[string][]string{
 	"list":   {"routr list --all", "routr list --json --final"},
 	"answer": {"routr answer 3 2 --by human --expect 3f9a1c0e5b7d2a64   # the user chose 2; the fingerprint from the [routr] message or routr list --json",
 		"routr answer 3 1 --by agent --expect 3f9a1c0e5b7d2a64   # you decided it (answer = \"agent\")"},
-	"retry":   {"routr retry 3", "routr retry plan-to-impl-1"},
-	"cancel":  {"routr cancel 3", "routr cancel plan-to-impl-1"},
-	"flow":    {"routr flow list", "routr flow start plan-to-impl --task 'add retries to fetch' --wait", "routr flow show deep-research --toml > wide.toml   # edit, then: routr flow start --file wide.toml --task '…'"},
-	"doctor":  {"routr doctor", "routr doctor --json"},
-	"version": {"routr version", "routr version --json"},
+	"retry":    {"routr retry 3", "routr retry plan-to-impl-1"},
+	"cancel":   {"routr cancel 3", "routr cancel plan-to-impl-1"},
+	"flow":     {"routr flow list", "routr flow start plan-to-impl --task 'add retries to fetch' --wait", "routr flow show deep-research --toml > wide.toml   # edit, then: routr flow start --file wide.toml --task '…'"},
+	"main":     {"routr main", "routr main --json", "ROUTR_MAIN_AT=-1 routr main   # what one run with no threshold of ours would apply"},
+	"fallback": {"routr fallback claude:opus", "routr fallback pi:deepseek/deepseek-v4-pro --error '402: Insufficient Balance' --json"},
+	"config":   {"routr config", "routr config init", "routr config example > my-config.toml"},
+	"doctor":   {"routr doctor", "routr doctor --json"},
+	"version":  {"routr version", "routr version --json"},
 }
 
 func (a *app) run(args []string) int {
@@ -225,7 +231,7 @@ func (a *app) help(w io.Writer) {
 }
 
 // commandOrder is the order help lists the commands in.
-var commandOrder = []string{"start", "wait", "result", "send", "done", "list", "show", "hide", "close", "approve", "answer", "retry", "cancel", "flow", "roles", "watch", "doctor", "version"}
+var commandOrder = []string{"start", "wait", "result", "send", "done", "list", "show", "hide", "close", "approve", "answer", "retry", "cancel", "flow", "roles", "main", "fallback", "config", "watch", "doctor", "version"}
 
 // commandHelp is `routr CMD --help`: the usage line, each of fs's flags
 // with what it does and its default, and examples.

@@ -125,6 +125,9 @@ func TestTransient(t *testing.T) {
 		"OAuth token has expired. Please obtain a new token or refresh your existing token.": false,
 		"You've hit your limit · resets 5pm":                                                 false,
 		"Credit balance is too low":                                                          false,
+		`402: {"message":"Insufficient Balance (request_id: 88fc6ff6-85d0-45b4-a0bf-47d3768bd908)","type":"unknown_error","param":null,"code":"invalid_request_error"}`: false,
+		"402 Payment Required":                    false,
+		"Payment required: add funds to continue": false,
 		"There's an issue with the selected model (x). It may not exist or you may not have access to it. Run /model to pick a different model.": false,
 	} {
 		if got := transient(msg); got != want {

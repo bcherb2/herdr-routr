@@ -12,6 +12,7 @@
 //     model reads itself meanwhile is dropped, not repeated. After the user
 //     interrupted a turn, all of it waits until their next turn ends: Esc
 //     means they want to type, and a wake turn would take that from them.
+//     While the front end compacts the model's context, all of it waits.
 // A front end turns its harness's events into these calls, fetches the
 // results it is asked for, and delivers the message. The coordinator runs
 // no process and reads no file; one lives for one session.
@@ -89,6 +90,8 @@ export class Coordinator {
 	private turnRunning = false;
 	/** the user interrupted a turn, and has not finished one since */
 	private interrupted = false;
+	/** the front end is compacting the model's context: a wake turn now would race it */
+	private paused = false;
 	/** news held until the session is idle: worker id → its news */
 	private readonly deferred = new Map<number, WakeItem>();
 	/** news put into the running turn, and whether a model request has started since (the model read it) */
@@ -189,6 +192,17 @@ export class Coordinator {
 		return covered || (this.deferred.size > 0 && !this.interrupted);
 	}
 
+	/** The front end started compacting the model's context: all news waits, a person's question too. */
+	pause(): void {
+		this.paused = true;
+	}
+
+	/** The compaction is over. True when news waits for the next snapshot (take it soon). */
+	resume(): boolean {
+		this.paused = false;
+		return this.deferred.size > 0 && !this.interrupted;
+	}
+
 	/** Is the model's turn running? */
 	get busy(): boolean {
 		return this.turnRunning;
@@ -285,8 +299,8 @@ export class Coordinator {
 			return { wake: [], keep };
 		}
 		for (const i of released) this.deferred.set(i.worker.id, i);
-		// a person is needed: at once, into a running turn too; the rest once the session is idle; nothing right after an interrupt
-		const due = [...this.deferred.values()].filter((i) => !this.interrupted && (!this.turnRunning || NEEDS_PERSON.has(i.worker.state)));
+		// a person is needed: at once, into a running turn too; the rest once the session is idle; nothing right after an interrupt or during a compaction
+		const due = this.paused ? [] : [...this.deferred.values()].filter((i) => !this.interrupted && (!this.turnRunning || NEEDS_PERSON.has(i.worker.state)));
 		for (const i of due) this.deferred.delete(i.worker.id);
 		return { wake: due.sort((a, b) => a.worker.id - b.worker.id), keep };
 	}

@@ -158,7 +158,48 @@ With the extension loaded you don't need the `/routr` prompt template in
 | `ROUTR_WAKE_HOLD` | `120` | the longest a result waits for its siblings: seconds, or `90s`, `2m`, `1500ms`; `0` holds nothing |
 | `ROUTR_PI_VIEW` | `steps` | `steps` or `cards`: the view above the editor. `/routr view …` changes it for the session |
 | `ROUTR_PI_SKILL` | on | `0`: don't load the bundled skill |
+| `ROUTR_MAIN_CONTEXT` | `truncate` | `truncate`, `summarize` or `off`: how the main agent's context is cut; overrides config `[main] context` for this run ("The main agent's context") |
+| `ROUTR_MAIN_AT` | `150000` | cut once a run ends past this many tokens; overrides `[main] at`. `-1`: only Pi's own compaction near the model's window |
+| `ROUTR_MAIN_KEEP_TURNS` | `3` | the last turns a `truncate` keeps as they were; overrides `[main] keep_turns`. `-1`: no limit |
+| `ROUTR_MAIN_KEEP_TOKENS` | `40000` | at most this many tokens of those turns, below `at`; overrides `[main] keep_tokens`. `-1`: no limit |
+| `ROUTR_MAIN_STRIP_REASONING` | on | `0`: keep earlier turns' reasoning in the main agent's requests; overrides config `[main] strip_reasoning`, which the extension reads with `routr main --json` at session start (a routr too old for that command: the built-in `[main]` with the `ROUTR_MAIN_*` variables). By default each request drops the reasoning of every turn before the latest incoming message (yours, or a routr wake): Pi resends it otherwise, and a provider such as DeepSeek bills it as input on every later turn. Only for Chat Completions models (`api: openai-completions`: DeepSeek, OpenRouter, z.ai); the Responses APIs pair earlier tool calls with their reasoning, and Anthropic already ignores it. Each turn is resent once without its reasoning, uncached, when the next message arrives. The session file keeps it. Workers (`ROUTR_ID` set) are never changed |
 | `ROUTR_STATE_DIR` | from git | the `.routr` directory, as for the CLI |
+
+## The main agent's context
+
+On a long run the main agent's context is cut as config `[main]` says
+(skills/routr/cli.md, "[main]"; `routr main` prints it). The default:
+once a run ends past 150000 tokens, the extension truncates it before
+the next turn, with no model call. A note stands in for the earlier
+conversation: your first message word for word, what you wrote since,
+the latest `todo` list, this session's workers from a fresh `routr list`,
+and where state lives. The last 3 turns, at most 40000 tokens of them,
+follow as they were. Wakes wait until the cut is done, since a turn
+started meanwhile would be aborted by it. Pi's own compaction near the
+model's window is answered the same way; your `/compact` is still Pi's
+summary. `summarize` hands the cut to Pi's summary with instructions to
+keep worker and bead IDs. A worker's context is never touched. The
+session file keeps everything.
+
+Pi compacts nothing shorter than its `compaction.keepRecentTokens` of
+conversation (20000 by default), so with a low `at` the extension says
+once that the cut has to wait.
+
+## When the main agent's model fails
+
+When the main agent's run ends in an error that waiting won't fix (out
+of credit, a 402, quota, a usage limit, a login), the extension asks
+`routr fallback MODEL --error MSG --json` for the model's `[[fallback]]`
+rule (skills/routr/cli.md, "[[fallback]]"). It then switches to the
+first `pi:` entry Pi knows and has a key for, and carries on with a
+`[routr]` message naming the failure and the new model. A fallback that
+fails too moves on down the same rule's list. If the context would fill
+more than 80% of the new model's window, it is truncated first, to at
+most half of it. A model you switched to yourself is left alone. With no
+rule, or the list spent, it tells you, and wakes wait for your next
+message instead of each failing the same way. Errors that may pass
+(overloaded, a timeout) are left to Pi's own retry. A worker never
+switches its own model.
 
 ## How it knows which workers are "mine"
 
@@ -198,13 +239,19 @@ All from the Pi package's `docs/extensions.md` and its type declarations (Pi 1.0
 
 | API | For |
 |---|---|
-| `pi.on("session_start" / "session_shutdown")` | start and stop polling, restore claims from `ctx.sessionManager.getEntries()`; check the routr binary against this checkout (`routr version --json`, then `git diff --quiet REV HEAD -- cmd internal go.mod go.sum`) and warn if it is older |
+| `pi.on("session_start" / "session_shutdown")` | start and stop polling, restore claims from `ctx.sessionManager.getEntries()`; check the routr binary against this checkout (`routr version --json`, then `git diff --quiet REV HEAD -- cmd internal go.mod go.sum`) and warn if it is older; in the main agent, read the `[main]` settings (`routr main --json`) |
 | `pi.on("resources_discover")` → `skillPaths` | ship the routr skill (docs/extensions.md, "Resource Events"; example `dynamic-resources/`) |
 | `pi.on("tool_call")` | note a running `routr wait` / `--wait`, and hold the wakes it covers |
 | `pi.on("tool_result")` | read the model's `routr` bash calls and their output |
 | `pi.on("tool_execution_end")`, `pi.on("agent_end")` | a wait that ended without a result covers nothing any more |
 | `pi.on("before_agent_start")` → `systemPromptOptions.sections.routr` | a `<routr>` section, not a whole `systemPrompt`, so Pi records only its changes and keeps the cached prefix: "start workers without --wait; you'll be woken; leave out --permissions" (routr gives a Pi caller's workers `bypass`); while the binary is older than this checkout, "pass --permissions bypass, and tell the user to run install.sh" instead, since an old binary may not |
 | `pi.on("agent_start")` | group workers started in the same run |
+| `pi.on("context")` → `messages` | the main agent's requests without earlier turns' reasoning (`src/context.ts`); Pi passes a copy, so the session file is untouched |
+| `pi.on("agent_settled")`, `ctx.getContextUsage()`, `ctx.compact({customInstructions, onComplete, onError})` | past `[main] at` once the run has settled, compact; for `summarize`, with instructions naming the workers and the todo list |
+| `pi.on("session_before_compact")` → `{compaction: {summary, firstKeptEntryId, tokensBefore, details}}` | `truncate`: answer our compaction and Pi's threshold and overflow ones with the note and the last turns (`src/compaction.ts`, using Pi's `buildSessionProjection` and `estimateTokens`); the user's `/compact` (`reason: "manual"`, not ours) is left to Pi |
+| `pi.on("session_compact" / "session_compact_failed")` | the cut is over: wakes held for it go |
+| `pi.on("agent_end")` → the last assistant message's `stopReason: "error"` and `errorMessage`; `ctx.modelRegistry.find` / `hasConfiguredAuth`; `pi.setModel`, `pi.setThinkingLevel` | the model fallback: the next usable `[[fallback]]` model, then a `routr-fallback` message with `triggerTurn` |
+| `pi.getSettings().compaction.keepRecentTokens` | why Pi refused a cut ("Nothing to compact"), said once |
 | `pi.sendMessage({customType, content, display, details}, {triggerTurn: true, deliverAs})` | wake the model: `steer` when a worker needs a person, `followUp` otherwise ("pi.sendMessage") |
 | `pi.registerMessageRenderer("routr-wake")` | the wake as a compact card; expand for the full text ("Message and Entry Rendering") |
 | `ctx.ui.setWidget(key, factory)`, `ctx.ui.setStatus` | the steps or cards and the footer count ("Widgets, Status, and Footer"; docs/tui.md, Pattern 5) |

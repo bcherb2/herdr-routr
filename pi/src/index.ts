@@ -42,7 +42,10 @@ import {
 	type WakeMode,
 	type Worker,
 } from "../../frontend/core/index.ts";
-import { runRoutr, staleBinary, type Stale } from "./cli.ts";
+import { readMain, runRoutr, staleBinary, type Stale } from "./cli.ts";
+import { due, summaryInstructions, truncation } from "./compaction.ts";
+import { Chain, failure, modelName, parseFallback, piRef, type Failure } from "./fallback.ts";
+import { mainFromEnv, stripOldReasoning, type MainAgent } from "./context.ts";
 import { ANSWER_KEY, chooser, questionPicker } from "./dialogs.ts";
 import { LineTail } from "./tail.ts";
 
@@ -54,6 +57,11 @@ const WIDGET = "routr";
 const WAKE_TYPE = "routr-wake";
 const OUTPUT_TYPE = "routr-output";
 const CLAIMS_TYPE = "routr-claims";
+const FALLBACK_TYPE = "routr-fallback";
+/** a fallback model whose window this share of is already used gets the context cut first */
+const FIT = 0.8;
+/** and is cut to at most this share of it */
+const FIT_KEEP = 0.5;
 
 const POLL_BUSY_MS = 1500;
 const POLL_IDLE_MS = 5000;
@@ -114,6 +122,10 @@ function turnEnd(messages: readonly unknown[]): TurnEnd {
 	return "answer";
 }
 
+function firstLine(s: string): string {
+	return (s.split("\n")[0] ?? "").slice(0, 200);
+}
+
 function painter(theme: ExtensionContext["ui"]["theme"]): Paint {
 	const color: Record<Tone | "dim", Parameters<typeof theme.fg>[0]> = {
 		run: "accent",
@@ -148,10 +160,25 @@ export default function routr(pi: ExtensionAPI): void {
 	let gen = 0; // bumped on session start/shutdown; a refresh from an older session drops its result
 	/** the routr binary is older than this extension: settled once session_start's check returns */
 	let stale: Promise<Stale | undefined> = Promise.resolve(undefined);
+	/** the [main] settings, from `routr main --json` at session_start; a worker (ROUTR_ID set) reads none */
+	let main: Promise<MainAgent> = Promise.resolve(mainFromEnv());
 	let debounce: NodeJS.Timeout | undefined;
 	/** the answer dialog on screen: the question it shows of each worker (id → questionKey); a refresh closes it when one changes or goes away */
 	let dialog: { shown: Map<number, string>; abort: AbortController } | undefined;
 	let picking = false; // alt+q or /routr answer is running, dialogs and CLI calls
+	/** the main agent's context is being cut at [main] at: wakes wait for it */
+	let compacting = false;
+	let waking = 0; // wakes being fetched and sent: a compaction would abort the turn one starts
+	let toldTooSmall = false; // Pi refused a cut for keepRecentTokens: said once a session
+	/** the context size Pi last refused to cut at: the next try waits until it has grown a tenth */
+	let refusedAt = 0;
+	let interrupted = false; // the user's Esc ended the last run: they are about to type
+	/** this cut truncates whatever [main] context says, keeping at most this many tokens: the context must fit a fallback model's window */
+	let forceKeep: number | undefined;
+	let failed: Failure | undefined; // how the last run failed
+	let toldNoFallback = ""; // a routr fallback error, said once
+	let chain = new Chain(); // where the main agent is in a [[fallback]] rule's list
+	let stalled = false; // the model failed and no fallback took over: wakes wait for the user
 
 	function ui(fn: (c: ExtensionContext) => void): void {
 		if (!ctx?.hasUI) return;
@@ -290,14 +317,17 @@ export default function routr(pi: ExtensionAPI): void {
 			for (const k of keep) pi.appendEntry<ClaimsEntry>(CLAIMS_TYPE, k);
 			syncTails();
 			if (items.length > 0) {
-				wake(c, items).catch((e: unknown) => {
-					// held again for the next refresh, so a failed delivery doesn't lose a result
-					const { held, dropped } = c.deliveryFailed(items);
-					const why = e instanceof Error ? e.message : String(e);
-					const retry = held.length ? "; retrying" : "";
-					const lost = dropped.length ? `; gave up on worker ${dropped.map((i) => i.worker.id).join(", ")} (routr list shows it)` : "";
-					ui((c) => c.ui.notify(`routr: could not deliver a result: ${why}${retry}${lost}`, "error"));
-				});
+				waking++;
+				wake(c, items)
+					.catch((e: unknown) => {
+						// held again for the next refresh, so a failed delivery doesn't lose a result
+						const { held, dropped } = c.deliveryFailed(items);
+						const why = e instanceof Error ? e.message : String(e);
+						const retry = held.length ? "; retrying" : "";
+						const lost = dropped.length ? `; gave up on worker ${dropped.map((i) => i.worker.id).join(", ")} (routr list shows it)` : "";
+						ui((c) => c.ui.notify(`routr: could not deliver a result: ${why}${retry}${lost}`, "error"));
+					})
+					.finally(() => waking--);
 			}
 		} finally {
 			refreshing = false;
@@ -432,8 +462,175 @@ export default function routr(pi: ExtensionAPI): void {
 		schedule(100);
 	}
 
+	/** This session's workers, as the note or the summary names them: a fresh list, else the last one. */
+	async function mineWorkers(): Promise<Worker[]> {
+		let workers = coord.workers;
+		const r = await runRoutr(["list", "--json"], cwd);
+		if (r.code === 0 && !r.missing) {
+			try {
+				workers = parseList(r.stdout);
+			} catch {
+				// the last snapshot's
+			}
+		}
+		return workers.filter((w) => coord.isMine(w));
+	}
+
+	/** Our compaction is over, however it ended: the news it held goes. */
+	function compactionOver(): void {
+		if (!compacting) return;
+		compacting = false;
+		forceKeep = undefined;
+		if (coord.resume()) schedule(0);
+	}
+
+	/**
+	 * Cut the main agent's context now, wakes held until it is over; then
+	 * `then`, however it ended (before wakes go). `keep`: truncate whatever
+	 * [main] context says, keeping at most that many tokens.
+	 */
+	function cut(c: ExtensionContext, tokens: number, opts: { customInstructions?: string; keep?: number; then?: () => void } = {}): void {
+		const mine = gen;
+		compacting = true;
+		forceKeep = opts.keep;
+		coord.pause();
+		const done = (): void => {
+			opts.then?.();
+			compactionOver();
+		};
+		c.compact({
+			customInstructions: opts.customInstructions,
+			onComplete: (r) => {
+				if (mine !== gen) return;
+				done();
+				const after = r.estimatedTokensAfter === undefined ? "" : ` to about ${r.estimatedTokensAfter}`;
+				ui((u) => u.ui.notify(`routr: cut the context from ${r.tokensBefore}${after} tokens`, "info"));
+			},
+			onError: (e) => {
+				if (mine !== gen) return;
+				done();
+				if (e.message === "Compaction cancelled") return;
+				if (/Nothing to compact/.test(e.message)) {
+					// Pi keeps its compaction.keepRecentTokens of conversation whatever an extension answers, and asks none below it
+					refusedAt = tokens;
+					if (toldTooSmall) return;
+					toldTooSmall = true;
+					const keep = pi.getSettings?.().compaction?.keepRecentTokens ?? 20_000;
+					return ui((u) =>
+						u.ui.notify(`routr: nothing to cut yet: Pi always keeps the last ${keep} tokens of conversation (compaction.keepRecentTokens), and [main] at counts the system prompt too`, "warning"),
+					);
+				}
+				ui((u) => u.ui.notify(`routr: could not cut the context: ${e.message}`, "warning"));
+			},
+		});
+	}
+
+	/** The model failed and nothing took over: say so, and hold wakes (each would fail the same way) until the user's next turn. */
+	function stall(text: string): void {
+		stalled = true;
+		coord.pause();
+		ui((u) => u.ui.notify(`${text}. Wakes wait until your next message; /model switches by hand.`, "error"));
+	}
+
+	/**
+	 * The main agent's run ended in `error`. If waiting won't fix it, move
+	 * to the next usable model of its [[fallback]] rule, cutting the context
+	 * first if it is too big for that model, and carry on. True when it
+	 * acted (moved or stalled).
+	 */
+	async function fallBack(c: ExtensionContext, f: Failure): Promise<boolean> {
+		if (!c.model) return false;
+		const name = modelName(c.model);
+		if (f.model && f.model !== name) return false; // the user switched model since: theirs to try
+		const error = f.error;
+		const mine = gen;
+		coord.pause(); // a wake turn now would fail on this model, or race the resend
+		try {
+			const acted = await walk(c, name, error, mine);
+			if (mine === gen && !stalled) coord.resume();
+			return acted;
+		} catch (e) {
+			if (mine === gen && !stalled) coord.resume();
+			throw e;
+		}
+	}
+
+	async function walk(c: ExtensionContext, name: string, error: string, mine: number): Promise<boolean> {
+		const r = await runRoutr(["fallback", name, "--error", error.slice(0, 4000), "--json"], cwd);
+		if (mine !== gen) return true;
+		const rule = r.code === 0 ? parseFallback(r.stdout) : undefined;
+		if (!rule && !r.missing && !/unknown command "fallback"/.test(r.stderr)) {
+			// a config routr rejects: no fallback, and the user hears why once
+			const why = (r.stderr || r.stdout).trim().split("\n")[0] ?? `exit ${r.code}`;
+			if (why !== toldNoFallback) ui((u) => u.ui.notify(`routr: no model fallback: ${why}`, "warning"));
+			toldNoFallback = why;
+		}
+		if (!rule || rule.lasting !== true) return false; // a routr without the command, or an error that may pass: Pi's own retry
+		// a fallback that failed too goes on down the list its chain started with
+		let next = chain.next(name);
+		if (!next) {
+			if (rule.rule === 0) {
+				stall(`routr: ${name} failed (${firstLine(error)}), and no [[fallback]] rule matches it`);
+				return true;
+			}
+			chain.start(name, rule.rule, rule.to);
+			next = { rule: rule.rule, candidates: rule.to };
+		}
+		const skipped: string[] = [];
+		for (const entry of next.candidates) {
+			const ref = piRef(entry);
+			const model = ref && c.modelRegistry.find(ref.provider, ref.id);
+			if (ref && modelName(ref) === name) skipped.push(`${entry}: the model that failed`);
+			else if (!ref) skipped.push(`${entry}: not a Pi model`);
+			else if (!model) skipped.push(`${entry}: Pi has no such model`);
+			else if (!c.modelRegistry.hasConfiguredAuth(model)) skipped.push(`${entry}: no API key in Pi`);
+			else if (!(await pi.setModel(model))) skipped.push(`${entry}: Pi would not switch to it`);
+			else if (mine !== gen) return true;
+			else {
+				chain.moved(entry);
+				if (ref.thinking) pi.setThinkingLevel(ref.thinking as Parameters<typeof pi.setThinkingLevel>[0]);
+				const why = skipped.length ? ` (skipped ${skipped.join("; ")})` : "";
+				ui((u) => u.ui.notify(`routr: ${name} failed (${firstLine(error)}); switched to ${entry}, [[fallback]] rule ${next.rule}${why}`, "warning"));
+				const resend = (): void =>
+					pi.sendMessage(
+						{
+							customType: FALLBACK_TYPE,
+							content: `[routr] Your last turn failed on ${name}: ${firstLine(error)}. You are now on ${entry} ([[fallback]] rule ${next.rule}). Carry on where you left off.`,
+							display: true,
+						},
+						{ triggerTurn: true, deliverAs: "followUp" },
+					);
+				const tokens = c.getContextUsage()?.tokens ?? 0;
+				if (tokens <= model.contextWindow * FIT) resend();
+				else
+					cut(c, tokens, {
+						keep: Math.floor(model.contextWindow * FIT_KEEP),
+						then: () => {
+							const now = c.getContextUsage()?.tokens;
+							if (now != null && now > model.contextWindow)
+								ui((u) => u.ui.notify(`routr: the context (${now} tokens) is still over ${entry}'s window of ${model.contextWindow}; Pi's overflow compaction takes it from here`, "warning"));
+							resend();
+						},
+					});
+				return true;
+			}
+		}
+		const why = skipped.length ? `: ${skipped.join("; ")}` : "";
+		stall(`routr: ${name} failed (${firstLine(error)}), and no model of [[fallback]] rule ${next.rule} is left to take over${why}`);
+		return true;
+	}
+
 	function stop(): void {
 		gen++;
+		compacting = false;
+		toldTooSmall = false;
+		refusedAt = 0;
+		interrupted = false;
+		forceKeep = undefined;
+		failed = undefined;
+		toldNoFallback = "";
+		chain = new Chain();
+		stalled = false;
 		coord.end();
 		dialog?.abort.abort();
 		dialog = undefined;
@@ -474,6 +671,13 @@ export default function routr(pi: ExtensionAPI): void {
 		if (c.mode === "tui" || c.mode === "rpc") schedule(0);
 		const mine = gen;
 		stale = staleBinary(repoDir, cwd);
+		if (!process.env.ROUTR_ID) {
+			const read = readMain(cwd);
+			main = read.then((r) => r.main);
+			void read.then((r) => {
+				if (r.error && mine === gen) ui((u) => u.ui.notify(`routr: ${r.error}; the main agent uses the [main] defaults`, "warning"));
+			});
+		}
 		void stale.then((s) => {
 			if (s && mine === gen)
 				ui((u) => u.ui.notify(`routr: the installed binary${s.revision ? ` (${s.revision})` : ""} is older than ${s.repo}; run ${s.repo}/install.sh`, "warning"));
@@ -485,11 +689,20 @@ export default function routr(pi: ExtensionAPI): void {
 		ctx = undefined;
 	});
 
-	pi.on("agent_start", () => coord.turnStarted());
+	pi.on("agent_start", () => {
+		coord.turnStarted();
+		if (!stalled) return;
+		// the user acted: wakes go again
+		stalled = false;
+		if (coord.resume()) schedule(200);
+	});
 
 	pi.on("agent_end", (event) => {
 		// every tool call of the run is over, however it ended; news held for the end of the turn goes now
-		if (coord.turnEnded(turnEnd(event.messages))) schedule(200);
+		const how = turnEnd(event.messages);
+		interrupted = how === "aborted";
+		failed = failure(event.messages);
+		if (coord.turnEnded(how)) schedule(200);
 	});
 
 	pi.on("before_agent_start", async (event) => {
@@ -503,6 +716,74 @@ export default function routr(pi: ExtensionAPI): void {
 			" it wakes you with their results (a message starting with [routr])." +
 			permissions;
 	});
+
+	// The main agent only: a worker's reasoning is about the code it is changing.
+	// Chat Completions only, where reasoning is plain text billed as input
+	// (DeepSeek, OpenRouter): the Responses APIs pair each earlier tool call with
+	// its reasoning item by id, and Anthropic already ignores earlier turns'.
+	pi.on("context", async (event, c) => {
+		if (process.env.ROUTR_ID || c.model?.api !== "openai-completions" || !(await main).strip_reasoning) return;
+		const messages = stripOldReasoning(event.messages);
+		return messages && { messages };
+	});
+
+	// The main agent's context past [main] at, once its run has settled: cut
+	// it now, between turns, with wakes held until the cut is done (a turn
+	// started meanwhile would be aborted by it).
+	pi.on("agent_settled", async (_event, c) => {
+		if (process.env.ROUTR_ID || compacting || interrupted || stalled) return;
+		const f = failed;
+		failed = undefined;
+		if (f !== undefined) {
+			try {
+				if (await fallBack(c, f)) return;
+			} catch (e) {
+				ui((u) => u.ui.notify(`routr: could not fall back from the failed model: ${e instanceof Error ? e.message : String(e)}`, "warning"));
+				return;
+			}
+		}
+		const m = await main;
+		const tokens = c.getContextUsage()?.tokens;
+		if (!due(m, tokens) || tokens! < refusedAt * 1.1 || !c.isIdle() || c.hasPendingMessages() || waking > 0 || compacting) return;
+		// a dry run: nothing older than the turns kept, nothing to ask Pi for
+		if (m.context === "truncate" && !truncation(c.sessionManager.getBranch(), m, { tokensBefore: 0, workers: [] })) return;
+		compacting = true; // claimed before the awaits below; cut() takes it over
+		coord.pause();
+		const mine = gen;
+		try {
+			const how = m.context === "summarize" ? "summarizing it" : m.keep_turns === 1 ? "keeping the last turn" : `keeping the last ${m.keep_turns === -1 ? "" : `${m.keep_turns} `}turns`;
+			if (!toldTooSmall) ui((u) => u.ui.notify(`routr: the context is at ${tokens} tokens, past ${m.at}; ${how}`, "info"));
+			const customInstructions = m.context === "summarize" ? summaryInstructions(c.sessionManager.getBranch(), await mineWorkers()) : undefined;
+			if (mine !== gen) return;
+			if (!c.isIdle() || c.hasPendingMessages()) return compactionOver(); // a message came meanwhile: it goes first, and the next settle decides again
+			cut(c, tokens!, { customInstructions });
+		} catch (e) {
+			// never leave the wakes held
+			if (mine === gen) compactionOver();
+			ui((u) => u.ui.notify(`routr: could not cut the context: ${e instanceof Error ? e.message : String(e)}`, "warning"));
+		}
+	});
+
+	// Our cut, and Pi's own when the context nears its window, in the
+	// [main] context's way: truncate answers with a note and the last turns,
+	// no model call; summarize leaves it to Pi's summary. The user's /compact
+	// is Pi's summary. Nothing for a worker.
+	pi.on("session_before_compact", async (event) => {
+		if (process.env.ROUTR_ID) return;
+		const ours = compacting && event.reason === "manual";
+		if (event.reason === "manual" && !ours) return;
+		const m = await main;
+		const forced = ours ? forceKeep : undefined;
+		if (m.context !== "truncate" && forced === undefined) return;
+		const keep = forced === undefined ? m : { ...m, keep_tokens: m.keep_tokens === -1 ? forced : Math.min(m.keep_tokens, forced) };
+		const compaction = truncation(event.branchEntries, keep, { tokensBefore: event.preparation.tokensBefore, workers: await mineWorkers() });
+		if (compaction) return { compaction };
+		// nothing to cut: ours stops; Pi's own goes on with its summary
+		return ours ? { cancel: true } : undefined;
+	});
+
+	pi.on("session_compact", () => compactionOver());
+	pi.on("session_compact_failed", () => compactionOver());
 
 	// A `routr wait` (or `--wait`) the model is running will hand it these
 	// results itself: hold their wake until the call returns.
