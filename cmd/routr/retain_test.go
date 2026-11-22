@@ -37,7 +37,8 @@ func TestRetentionFollowsTheConfig(t *testing.T) {
 	}{
 		{"the default keeps 14 days", "", false},
 		{"keep_days", "[registry]\nkeep_days = 1\n", true},
-		{"a config it cannot read keeps everything", "[registry]\nkeep_days = 1\nbogus = 1\n", false},
+		{"a config it cannot read keeps everything", "[registry]\nkeep_days = 1\nmax = -5\n", false},
+		{"an unknown key is ignored", "[registry]\nkeep_days = 1\nbogus = 1\n", true},
 	} {
 		t.Run(k.name, func(t *testing.T) {
 			c := newCLI(t)

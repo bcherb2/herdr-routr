@@ -1,0 +1,41 @@
+id = "routr"
+name = "routr"
+# The release this checkout installs: scripts/plugin-build.sh downloads tag
+# v<version>, so bump it together with the tag.
+version = "0.1.0"
+# Socket protocol 22, which routr's client speaks, arrived in herdr 0.9.0.
+min_herdr_version = "0.9.0"
+description = "Let your coding agent start Claude Code, Codex and Pi workers in their own herdr tabs, chain them into flows, and get their results back"
+platforms = ["linux", "macos"]
+
+# Downloads the release binary into bin/routr and checks its checksum; builds
+# with go when there is no release for this version. Then it moves the links
+# routr setup made into the previous install to this one. Installs nothing
+# else.
+[[build]]
+command = ["sh", "scripts/plugin-build.sh"]
+
+# routr setup in a popup: links bin/routr onto PATH and this install to
+# ~/.local/share/routr/plugin, writes routr's config, checks herdr and the
+# harnesses, and prints the command that adds each front end from that
+# link, which updates keep pointing at the current install. The popup closes
+# when its command exits, so it waits for Enter.
+[[panes]]
+id = "setup"
+title = "routr setup"
+placement = "popup"
+width = "90%"
+height = "80%"
+command = ["sh", "-c", "\"$HERDR_PLUGIN_ROOT/bin/routr\" setup; printf '\\nPress Enter to close. '; read -r _"]
+
+# Bind it in herdr's config.toml (manifests cannot declare keys):
+#   [[keys.command]]
+#   key = "prefix+R"
+#   type = "plugin_action"
+#   command = "routr.setup"
+#   description = "routr setup"
+[[actions]]
+id = "setup"
+title = "Set up routr"
+contexts = ["workspace", "pane"]
+command = ["sh", "-c", "exec \"$HERDR_BIN_PATH\" plugin pane open --plugin \"$HERDR_PLUGIN_ID\" --entrypoint setup"]

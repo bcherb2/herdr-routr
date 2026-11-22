@@ -37,15 +37,19 @@
 
 # The main agent (the session that starts workers, never a worker): once a
 # run ends with its context past `at` tokens, cut it before the next turn.
-# truncate: a note in place of the earlier conversation (your first message
-# word for word, what you wrote since, the todo list, the workers) and the
-# last keep_turns turns, at most keep_tokens; no model call. summarize: the
-# harness's own summary. off: leave it. 0 is the default, -1 no limit.
+# truncate: the session's first turn as it was (keep_head; at most
+# head_tokens of it), a note in place of the rest of the earlier conversation
+# (your first message word for word, what you wrote since, the todo list, the
+# workers) and the last keep_turns turns, at most keep_tokens; no model call.
+# summarize: the harness's own summary. off: leave it. 0 is the default, -1
+# no limit.
 #[main]
 #context = "truncate"
 #at = 150000
 #keep_turns = 3
 #keep_tokens = 40000
+#keep_head = true
+#head_tokens = 40000
 #strip_reasoning = true
 
 # Where a model's work goes when it fails in a way waiting won't fix: out of

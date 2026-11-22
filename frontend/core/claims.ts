@@ -16,10 +16,36 @@
 //     cancelled, whose news the model no longer wants.
 // `--json` output is read as the registry record(s).
 //
+// Ids are per registry, and the model may run routr against another repo's
+// (`cd ../other && routr start …`). So each claim says where it was made
+// (Place): the registry a "queued" line or a record's `run_dir` names, else
+// where the command line put the call (`cd`, `--root`, ROUTR_STATE_DIR).
+// Claims in the session's own working directory are the top-level fields;
+// the rest are `elsewhere`, for the front end to resolve to a registry.
+//
 // A command that already waited for the result (`routr wait`, `--wait`,
 // `routr result`) and returned it marks those workers as `seen`, so the
 // extension doesn't wake the model with a result it just read. While such a
 // command runs, `waitCover` says which workers it will return.
+
+/**
+ * Where a routr call keeps its registry, when that may not be the session's:
+ * the registry itself (ROUTR_STATE_DIR, or the one a "queued" line or a
+ * record's `run_dir` names), a repo root (`--root`), or the directory the
+ * call ran in (`cd`), whose registry the CLI's rule finds
+ * (skills/routr/cli.md, "Where state lives"). Paths are as written: a
+ * relative one is against the session's working directory, and `~` is the
+ * user's home. The front end resolves it (Coordinator `locate`).
+ */
+export type Place = { registry: string } | { root: string } | { cwd: string };
+
+/** Where a call is: the session's working directory (undefined), a Place, or somewhere only the shell knows (null). */
+type Where = Place | undefined | null;
+
+/** A cache key for a Place. */
+export function placeKey(at: Place): string {
+	return JSON.stringify(at);
+}
 
 export interface Claims {
 	/** workers the call started, or the model now waits to hear about */
@@ -33,6 +59,13 @@ export interface Claims {
 	cancelled: number[];
 	/** chains the command cancelled (some of their workers, at least) */
 	cancelledChains: string[];
+	/** the same, made at another place than the session's working directory; absent when there are none. Claims made where only the shell knows are dropped. */
+	elsewhere?: PlacedClaims[];
+}
+
+/** Claims made at one place. */
+export interface PlacedClaims extends Omit<Claims, "elsewhere"> {
+	at: Place;
 }
 
 const EMPTY: Claims = { ids: [], chains: [], seen: [], seenChains: [], cancelled: [], cancelledChains: [] };
@@ -135,14 +168,62 @@ function shellCommands(line: string): string[][] {
 	return out;
 }
 
-/** A `routr` (or "$ROUTR_BIN") invocation's subcommand words, per simple command of a shell line. */
-function routrCalls(command: string): string[][] {
-	const calls: string[][] = [];
+/** One `routr` invocation: its subcommand words, and where it runs. */
+interface Call {
+	args: string[];
+	at: Where;
+}
+
+/** A `routr` (or "$ROUTR_BIN") invocation per simple command of a shell line, each with where the `cd`s, exports and flags before it put it. */
+function routrCalls(command: string): Call[] {
+	const calls: Call[] = [];
+	let dir: string | undefined | null; // where `cd` went: undefined = nowhere, null = only the shell knows
+	let state: string | undefined; // an exported ROUTR_STATE_DIR
 	for (const words of shellCommands(command)) {
 		const at = words.findIndex((w) => ROUTR_WORD.test(w));
-		if (at >= 0) calls.push(words.slice(at + 1));
+		if (at >= 0) {
+			const args = words.slice(at + 1);
+			calls.push({ args, at: placeOf(dir, stateDir(words.slice(0, at)) ?? state, args) });
+			continue;
+		}
+		const [verb, ...rest] = words;
+		if (verb === "cd" || verb === "pushd") {
+			const to = rest.find((w) => !/^-[LPe@]+$/.test(w)) ?? "~";
+			dir = to === "-" ? null : under(dir, to);
+		} else if (verb === "export") {
+			state = stateDir(rest) ?? state;
+		}
 	}
 	return calls;
+}
+
+/** The ROUTR_STATE_DIR among assignment words (`ROUTR_STATE_DIR=… routr`, `export ROUTR_STATE_DIR=…`). */
+function stateDir(words: readonly string[]): string | undefined {
+	let v: string | undefined;
+	for (const w of words) if (w.startsWith("ROUTR_STATE_DIR=")) v = w.slice("ROUTR_STATE_DIR=".length);
+	return v || undefined;
+}
+
+/** Path p as a command gives it, against dir (where `cd` went); null when only the shell knows it. */
+function under(dir: string | undefined | null, p: string): string | null {
+	if (p.includes("$")) return null; // a variable, or a $(…)
+	if (p.startsWith("/") || p === "~" || p.startsWith("~/")) return p;
+	if (dir === null) return null;
+	return dir === undefined ? p : `${dir.replace(/\/+$/, "")}/${p}`;
+}
+
+/** Where a routr call keeps its registry, by the CLI's order: --root, then ROUTR_STATE_DIR, then its directory. */
+function placeOf(dir: string | undefined | null, state: string | undefined, args: string[]): Where {
+	const root = flagValue(args, "--root");
+	if (root !== undefined) {
+		const r = under(dir, root);
+		return r === null ? null : { root: r };
+	}
+	if (state !== undefined) {
+		const r = under(dir, state);
+		return r === null ? null : { registry: r };
+	}
+	return dir === undefined || dir === null ? dir : { cwd: dir };
 }
 
 /** Shell words that print nothing themselves, so a bare number in the output came from routr. */
@@ -256,22 +337,45 @@ function balancedEnd(text: string, from: number): number {
 	return -1;
 }
 
-function records(values: unknown[]): { ids: number[]; chains: string[] } {
-	const ids: number[] = [];
-	const chains: string[] = [];
+/** A registry record's id and chain, and its registry when its `run_dir` (<registry>/runs/<id>) names it. */
+interface Rec {
+	id?: number;
+	chain?: string;
+	registry?: string;
+}
+
+function records(values: unknown[]): Rec[] {
+	const out: Rec[] = [];
 	for (const v of values) {
 		for (const it of Array.isArray(v) ? v : [v]) {
 			if (it === null || typeof it !== "object") continue;
 			const r = it as Record<string, unknown>;
-			if (typeof r.id === "number") ids.push(r.id);
-			if (typeof r.chain === "string" && r.chain) chains.push(r.chain);
+			const dir = typeof r.run_dir === "string" ? /^(\/.*)\/runs\/\d+\/?$/.exec(r.run_dir)?.[1] : undefined;
+			out.push({
+				id: typeof r.id === "number" ? r.id : undefined,
+				chain: typeof r.chain === "string" && r.chain ? r.chain : undefined,
+				registry: dir,
+			});
 		}
 	}
-	return { ids, chains };
+	return out;
 }
 
-/** "routr: queued worker 7 review · codex …" (start) and "routr: queued 8 plan · claude …" (flow start), on stderr. */
-const QUEUED = /^routr: queued (?:worker )?(\d+) /gm;
+/** A record's place: the registry its run_dir names, else `at`. */
+function recAt(r: Rec, at: Where): Where {
+	return r.registry ? { registry: r.registry } : at;
+}
+
+/**
+ * "routr: queued worker 7 review · codex (…); registry /repo/.routr" (start)
+ * and "routr: queued 8 plan · claude (…) step plan; registry …" (flow start),
+ * on stderr. A routr older than the registry note ends the line before it.
+ */
+const QUEUED = /^routr: queued (?:worker )?(\d+) (.*)$/gm;
+/** "routr: queued follow-up 2 for 7 review · codex; it goes into its tab; registry /repo/.routr" (send). */
+const FOLLOW_UP = /^routr: queued follow-up \d+ for (\d+) (.*)$/gm;
+/** The registry note that ends a "queued" line. */
+const REGISTRY_NOTE = /; registry (\/.*)$/;
 /** "routr: cancelled 4 research · claude" per worker `routr cancel` cancelled. */
 const CANCELLED = /^routr: cancelled (\d+)\b/gm;
 /**
@@ -281,101 +385,176 @@ const CANCELLED = /^routr: cancelled (\d+)\b/gm;
  */
 const WAIT_AGAIN = /Run: routr wait (\S+)\s*$/gm;
 
-/** Workers `routr cancel` cancelled: its "cancelled" lines, or its --json record. */
-function cancelledBy(output: string, values: unknown[]): Set<number> {
-	const out = new Set<number>();
-	for (const m of output.matchAll(CANCELLED)) out.add(Number(m[1]));
+/** Workers `routr cancel` (run at `at`) cancelled: its "cancelled" lines, or its --json record; each with its place. */
+function cancelledBy(output: string, values: unknown[], at: Where): Map<number, Where> {
+	const out = new Map<number, Where>();
+	for (const m of output.matchAll(CANCELLED)) out.set(Number(m[1]), at);
 	for (const v of values) {
 		if (v === null || typeof v !== "object" || Array.isArray(v)) continue;
 		const r = v as Record<string, unknown>;
-		if (r.action === "cancel") for (const id of records([r.workers]).ids) out.add(id);
+		if (r.action === "cancel") for (const rec of records([r.workers])) if (rec.id !== undefined) out.set(rec.id, recAt(rec, at));
 	}
 	return out;
+}
+
+/** Ids a "queued" line (QUEUED, FOLLOW_UP) names, with the registry its note names. */
+function registryNotes(output: string, line: RegExp): Map<number, Place | undefined> {
+	const out = new Map<number, Place | undefined>();
+	for (const m of output.matchAll(line)) {
+		const reg = REGISTRY_NOTE.exec(m[2]!)?.[1];
+		out.set(Number(m[1]), reg ? { registry: reg } : undefined);
+	}
+	return out;
+}
+
+interface Sets {
+	ids: Set<number>;
+	chains: Set<string>;
+	seen: Set<number>;
+	seenChains: Set<string>;
+	cancelled: Set<number>;
+	cancelledChains: Set<string>;
+}
+
+/** Claims grouped by where they were made; those made where only the shell knows are dropped. */
+class Tally {
+	private readonly by = new Map<string, { at: Place | undefined; sets: Sets }>();
+
+	at(where: Where): Sets | undefined {
+		if (where === null) return undefined;
+		const k = where === undefined ? "" : placeKey(where);
+		let e = this.by.get(k);
+		if (!e) {
+			e = { at: where, sets: { ids: new Set(), chains: new Set(), seen: new Set(), seenChains: new Set(), cancelled: new Set(), cancelledChains: new Set() } };
+			this.by.set(k, e);
+		}
+		return e.sets;
+	}
+
+	claims(): Claims {
+		const list = (s: Sets): Omit<Claims, "elsewhere"> => ({
+			ids: [...s.ids],
+			chains: [...s.chains],
+			seen: [...s.seen],
+			seenChains: [...s.seenChains],
+			cancelled: [...s.cancelled],
+			cancelledChains: [...s.cancelledChains],
+		});
+		const here = this.by.get("");
+		const elsewhere: PlacedClaims[] = [];
+		for (const { at, sets } of this.by.values()) {
+			if (at !== undefined && Object.values(sets).some((x: Set<unknown>) => x.size > 0)) elsewhere.push({ at, ...list(sets) });
+		}
+		const top = here ? list(here.sets) : { ...EMPTY };
+		return elsewhere.length > 0 ? { ...top, elsewhere } : top;
+	}
 }
 
 /**
  * Claims made by one bash call.
  * @param command the bash tool's `command` input
  * @param output its text output (stdout and stderr as Pi shows them)
- * @param startedMeanwhile this session's workers created while the call ran:
- *   a wait on what the call started itself returned them, even when the
- *   output doesn't name them
+ * @param startedMeanwhile this session's workers (of its own registry)
+ *   created while the call ran: a wait on what the call started itself
+ *   returned them, even when the output doesn't name them
  */
 export function parseClaims(command: string, output: string, startedMeanwhile: readonly number[] = []): Claims {
 	const calls = routrCalls(stripHeredocs(command));
 	if (calls.length === 0) return EMPTY;
-	const starts = calls.some((a) => sub(a) === "start");
-	const flow = calls.some((a) => sub(a) === "flow start");
-	const waited = calls.map(waits).filter((w) => w !== undefined);
-	const reads = waited.length > 0 || calls.some((a) => sub(a) === "result");
+	const starts = calls.filter((c) => sub(c.args) === "start");
+	const flows = calls.filter((c) => sub(c.args) === "flow start");
+	const waited = calls.map((c) => waits(c.args)).filter((w) => w !== undefined);
+	const readers = calls.filter((c) => waits(c.args) !== undefined || sub(c.args) === "result");
+	// output lines can't be told apart by call: they count where the first call of their kind ran
+	const startAt = (starts[0] ?? flows[0])?.at;
+	const readAt = readers[0]?.at;
+	const t = new Tally();
 
-	const ids = new Set<number>();
-	const chains = new Set<string>();
-	const seen = new Set<number>();
-	const seenChains = new Set<string>();
-
-	for (const a of calls) {
-		const s = sub(a);
-		const t = target(a);
-		if (s === "send" && t.id !== undefined) (a.includes("--wait") ? seen : ids).add(t.id);
-		if (s === "result" && t.id !== undefined) seen.add(t.id);
+	const followUps = registryNotes(output, FOLLOW_UP);
+	for (const c of calls) {
+		const s = sub(c.args);
+		const tg = target(c.args);
+		const p = t.at(c.at);
+		if (s === "send" && tg.id !== undefined) {
+			const q = followUps.get(tg.id) ? t.at(followUps.get(tg.id)) : p;
+			(c.args.includes("--wait") ? q?.seen : q?.ids)?.add(tg.id);
+		}
+		if (s === "result" && tg.id !== undefined) p?.seen.add(tg.id);
 		if (s === "wait") {
-			if (t.id !== undefined) seen.add(t.id);
-			if (t.chain !== undefined) seenChains.add(t.chain);
+			if (tg.id !== undefined) p?.seen.add(tg.id);
+			if (tg.chain !== undefined) p?.seenChains.add(tg.chain);
 		}
 	}
 
-	const started = new Set<number>();
-	for (const m of output.matchAll(QUEUED)) started.add(Number(m[1]));
+	const started = new Map<number, Where>();
+	const queued = registryNotes(output, QUEUED);
+	for (const [id, at] of queued) started.set(id, at ?? startAt);
 
 	const values = jsonValues(output);
-	const cancels = calls.filter((a) => sub(a) === "cancel");
-	const cancelled = cancels.length > 0 ? cancelledBy(output, values) : new Set<number>();
+	const cancels = calls.filter((c) => sub(c.args) === "cancel");
+	const cancelled = cancels.length > 0 ? cancelledBy(output, values, cancels[0]!.at) : new Map<number, Where>();
+	for (const [id, at] of cancelled) t.at(at)?.cancelled.add(id);
 	// a chain counts once the output says it cancelled something: "nothing to cancel" cancelled nothing
-	const cancelledChains = cancelled.size > 0 ? cancels.flatMap((a) => target(a).chain ?? []) : [];
+	if (cancelled.size > 0) for (const c of cancels) if (target(c.args).chain !== undefined) t.at(c.at)?.cancelledChains.add(target(c.args).chain!);
 	if (values.length > 0) {
-		const r = records(values);
-		for (const id of r.ids) {
-			if (starts || flow) started.add(id);
-			if (reads) seen.add(id);
+		for (const r of records(values)) {
+			if (r.id !== undefined && (starts.length || flows.length)) started.set(r.id, recAt(r, startAt));
+			if (r.id !== undefined && readers.length) t.at(recAt(r, readAt))?.seen.add(r.id);
+			if (r.chain !== undefined && (starts.length || flows.length)) t.at(recAt(r, startAt))?.chains.add(r.chain);
 		}
-		for (const c of r.chains) if (starts || flow) chains.add(c);
 	} else {
 		const lines = output.split("\n").map((l) => l.trim()).filter(Boolean);
 		// Only when nothing else could have printed a bare number (wc -l, a counter …).
-		if (starts && !calls.some((a) => a.includes("--wait")) && !otherOutput(command)) {
-			for (const l of lines) if (/^\d+$/.test(l)) started.add(Number(l));
+		if (starts.length && !calls.some((c) => c.args.includes("--wait")) && !otherOutput(command)) {
+			for (const l of lines) if (/^\d+$/.test(l) && !started.has(Number(l))) started.set(Number(l), startAt);
 		}
-		if (calls.some((a) => sub(a) === "flow start" && !a.includes("--wait"))) {
+		const flow = flows.find((c) => !c.args.includes("--wait"));
+		if (flow) {
 			const last = lines.at(-1);
-			if (last && CHAIN_ID.test(last)) chains.add(last);
+			// the chain is in the registry its steps' "queued" lines name, when they agree
+			const regs = new Set([...queued.values()].map((at) => (at ? placeKey(at) : "")));
+			const only = regs.size === 1 ? [...queued.values()][0] : undefined;
+			if (last && CHAIN_ID.test(last)) t.at(only ?? flow.at)?.chains.add(last);
 		}
 	}
-	for (const id of started) ids.add(id);
+	for (const [id, at] of started) t.at(at)?.ids.add(id);
 	// A wait on what this very command started (`start --wait`, `… | routr wait -`) returned it.
-	if (waited.some((w) => w.fresh)) for (const id of [...started, ...startedMeanwhile]) seen.add(id);
+	if (waited.some((w) => w.fresh)) {
+		for (const [id, at] of started) t.at(at)?.seen.add(id);
+		for (const id of startedMeanwhile) t.at(undefined)!.seen.add(id);
+	}
 
 	// A wait that ran out of time names the worker to wait on again.
 	for (const m of output.matchAll(WAIT_AGAIN)) {
 		const v = m[1]!;
-		if (v === "ID" || v === "CHAIN" || !CHAIN_ID.test(v)) continue;
+		const p = t.at(readAt);
+		if (v === "ID" || v === "CHAIN" || !CHAIN_ID.test(v) || !p) continue;
 		if (/^\d+$/.test(v)) {
-			ids.add(Number(v));
-			seen.delete(Number(v));
+			p.ids.add(Number(v));
+			p.seen.delete(Number(v));
 		} else {
-			chains.add(v);
-			seenChains.delete(v);
+			p.chains.add(v);
+			p.seenChains.delete(v);
 		}
 	}
 
-	return {
-		ids: [...ids],
-		chains: [...chains],
-		seen: [...seen],
-		seenChains: [...seenChains],
-		cancelled: [...cancelled],
-		cancelledChains: [...new Set(cancelledChains)],
+	return t.claims();
+}
+
+/** Every place a bash call's routr calls ran at, or its output names a registry of: what a front end resolves for `locate`. */
+export function places(command: string, output = ""): Place[] {
+	const out = new Map<string, Place>();
+	const add = (at: Where): void => {
+		if (at) out.set(placeKey(at), at);
 	};
+	for (const c of routrCalls(stripHeredocs(command))) add(c.at);
+	for (const line of [QUEUED, FOLLOW_UP]) for (const at of registryNotes(output, line).values()) add(at);
+	for (const r of records(jsonValues(output))) if (r.registry) add({ registry: r.registry });
+	for (const v of jsonValues(output)) {
+		const workers = v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>).workers : undefined;
+		for (const r of records([workers])) if (r.registry) add({ registry: r.registry });
+	}
+	return [...out.values()];
 }
 
 /** What a running bash call will hand the model when it returns. */
@@ -384,17 +563,32 @@ export interface WaitCover {
 	chains: string[];
 	/** it waits on workers it starts itself, or reads from stdin: any this session starts meanwhile */
 	fresh: boolean;
+	/** what it waits on at another place than the session's working directory; absent when nothing */
+	elsewhere?: { at: Place; ids: number[]; chains: string[] }[];
 }
 
 /** The workers a `routr wait` / `--wait` call covers, read before it runs; undefined if it waits on none. */
 export function waitCover(command: string): WaitCover | undefined {
-	const waited = routrCalls(stripHeredocs(command))
-		.map(waits)
-		.filter((w) => w !== undefined);
+	const waited = routrCalls(stripHeredocs(command)).flatMap((c) => {
+		const w = waits(c.args);
+		return w ? [{ ...w, at: c.at }] : [];
+	});
 	if (waited.length === 0) return undefined;
+	const at = new Map<string, { at: Place | undefined; ids: number[]; chains: string[] }>();
+	for (const w of waited) {
+		if (w.at === null) continue; // only the shell knows where
+		const k = w.at === undefined ? "" : placeKey(w.at);
+		const e = at.get(k) ?? { at: w.at, ids: [], chains: [] };
+		at.set(k, e);
+		if (w.id !== undefined) e.ids.push(w.id);
+		if (w.chain !== undefined) e.chains.push(w.chain);
+	}
+	const here = at.get("");
+	const elsewhere = [...at.values()].flatMap((e) => (e.at === undefined ? [] : [{ at: e.at, ids: e.ids, chains: e.chains }]));
 	return {
-		ids: waited.flatMap((w) => (w.id === undefined ? [] : [w.id])),
-		chains: waited.flatMap((w) => (w.chain === undefined ? [] : [w.chain])),
+		ids: here?.ids ?? [],
+		chains: here?.chains ?? [],
 		fresh: waited.some((w) => w.fresh),
+		...(elsewhere.length > 0 ? { elsewhere } : {}),
 	};
 }

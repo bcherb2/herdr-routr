@@ -17,6 +17,8 @@ type Main struct {
 	At             int    `toml:"at"`              // compact once the context passes this many tokens after a turn; 0 = 150000
 	KeepTurns      int    `toml:"keep_turns"`      // the last turns a compaction keeps as they are; 0 = 3
 	KeepTokens     int    `toml:"keep_tokens"`     // at most this many tokens of them; 0 = 40000
+	KeepHead       *bool  `toml:"keep_head"`       // a truncation keeps the session's first turn as it was, before its note; unset = true
+	HeadTokens     int    `toml:"head_tokens"`     // at most this many tokens of that first turn; 0 = 40000
 	StripReasoning *bool  `toml:"strip_reasoning"` // drop earlier turns' reasoning from each request; unset = true
 }
 
@@ -27,6 +29,8 @@ type MainAgent struct {
 	At             int    `json:"at"`
 	KeepTurns      int    `json:"keep_turns"`
 	KeepTokens     int    `json:"keep_tokens"`
+	KeepHead       bool   `json:"keep_head"`
+	HeadTokens     int    `json:"head_tokens"`
 	StripReasoning bool   `json:"strip_reasoning"`
 }
 
@@ -47,7 +51,7 @@ func (c Config) MainAgent(getenv func(string) string) (MainAgent, error) {
 	for _, k := range []struct {
 		env string
 		to  *int
-	}{{"ROUTR_MAIN_AT", &m.At}, {"ROUTR_MAIN_KEEP_TURNS", &m.KeepTurns}, {"ROUTR_MAIN_KEEP_TOKENS", &m.KeepTokens}} {
+	}{{"ROUTR_MAIN_AT", &m.At}, {"ROUTR_MAIN_KEEP_TURNS", &m.KeepTurns}, {"ROUTR_MAIN_KEEP_TOKENS", &m.KeepTokens}, {"ROUTR_MAIN_HEAD_TOKENS", &m.HeadTokens}} {
 		v := getenv(k.env)
 		if v == "" {
 			continue
@@ -59,14 +63,19 @@ func (c Config) MainAgent(getenv func(string) string) (MainAgent, error) {
 		}
 		*k.to = n
 	}
-	switch v := getenv("ROUTR_MAIN_STRIP_REASONING"); strings.ToLower(v) {
-	case "":
-	case "1", "true", "on":
-		m.StripReasoning = new(true)
-	case "0", "false", "off":
-		m.StripReasoning = new(false)
-	default:
-		errs = append(errs, fmt.Errorf("ROUTR_MAIN_STRIP_REASONING = %q: use 1 or 0", v))
+	for _, k := range []struct {
+		env string
+		to  **bool
+	}{{"ROUTR_MAIN_KEEP_HEAD", &m.KeepHead}, {"ROUTR_MAIN_STRIP_REASONING", &m.StripReasoning}} {
+		switch v := getenv(k.env); strings.ToLower(v) {
+		case "":
+		case "1", "true", "on":
+			*k.to = new(true)
+		case "0", "false", "off":
+			*k.to = new(false)
+		default:
+			errs = append(errs, fmt.Errorf("%s = %q: use 1 or 0", k.env, v))
+		}
 	}
 	errs = append(errs, m.validate()...)
 	if len(errs) == 0 {
@@ -84,6 +93,8 @@ func (m Main) resolve() MainAgent {
 		At:             cmp.Or(m.At, 150_000),
 		KeepTurns:      cmp.Or(m.KeepTurns, 3),
 		KeepTokens:     cmp.Or(m.KeepTokens, 40_000),
+		KeepHead:       m.KeepHead == nil || *m.KeepHead,
+		HeadTokens:     cmp.Or(m.HeadTokens, 40_000),
 		StripReasoning: m.StripReasoning == nil || *m.StripReasoning,
 	}
 }
@@ -98,7 +109,7 @@ func (m Main) validate() []error {
 	for _, k := range []struct {
 		key, unit string
 		v         int
-	}{{"at", "tokens", m.At}, {"keep_turns", "turns", m.KeepTurns}, {"keep_tokens", "tokens", m.KeepTokens}} {
+	}{{"at", "tokens", m.At}, {"keep_turns", "turns", m.KeepTurns}, {"keep_tokens", "tokens", m.KeepTokens}, {"head_tokens", "tokens", m.HeadTokens}} {
 		if k.v < Unlimited {
 			errs = append(errs, fmt.Errorf("main.%s = %d: use a number of %s, 0 for the default or -1 for no limit", k.key, k.v, k.unit))
 		}
@@ -120,6 +131,9 @@ func (m Main) combine() []error {
 	}
 	if r.At != Unlimited && r.KeepTokens != Unlimited && r.KeepTokens >= r.At {
 		errs = append(errs, fmt.Errorf("main.keep_tokens (%d) is not below main.at (%d): the context would be over the limit again straight after each cut", r.KeepTokens, r.At))
+	} else if r.Context == "truncate" && r.KeepHead && r.At != Unlimited && r.HeadTokens != Unlimited && r.KeepTokens != Unlimited && r.HeadTokens+r.KeepTokens >= r.At {
+		// A truncation that keeps the first turn keeps it as well as the last turns.
+		errs = append(errs, fmt.Errorf("main.head_tokens + main.keep_tokens (%d) is not below main.at (%d): the context would be over the limit again straight after each cut", r.HeadTokens+r.KeepTokens, r.At))
 	}
 	return errs
 }

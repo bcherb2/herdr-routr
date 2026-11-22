@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { jsonValues, parseClaims, waitCover } from "../claims.ts";
+import { jsonValues, parseClaims, places, waitCover } from "../claims.ts";
+
+const EMPTY_CLAIMS = { ids: [], chains: [], seen: [], seenChains: [], cancelled: [], cancelledChains: [] };
 
 test("routr start prints the id", () => {
 	assert.deepEqual(parseClaims(`routr start --role review --permissions auto 'Red-team PLAN.md'`, "7\n"), { ids: [7], chains: [], seen: [], seenChains: [], cancelled: [], cancelledChains: [] });
@@ -58,14 +60,18 @@ test("send: a follow-up the model waits to hear about, unless it waited", () => 
 
 test("flag values are not mistaken for ids or subcommands", () => {
 	assert.deepEqual(parseClaims(`routr wait --timeout 9m 3`, "Done."), { ids: [], chains: [], seen: [3], seenChains: [], cancelled: [], cancelledChains: [] });
-	assert.deepEqual(parseClaims(`routr --root /w wait --timeout=9m 4`, "Done."), { ids: [], chains: [], seen: [4], seenChains: [], cancelled: [], cancelledChains: [] });
-	assert.deepEqual(parseClaims(`routr --root /w flow start review --task x`, "c9"), { ids: [], chains: ["c9"], seen: [], seenChains: [], cancelled: [], cancelledChains: [] });
+	assert.deepEqual(parseClaims(`routr --root /w wait --timeout=9m 4`, "Done.").elsewhere, [
+		{ at: { root: "/w" }, ids: [], chains: [], seen: [4], seenChains: [], cancelled: [], cancelledChains: [] },
+	]);
+	assert.deepEqual(parseClaims(`routr --root /w flow start review --task x`, "c9").elsewhere, [
+		{ at: { root: "/w" }, ids: [], chains: ["c9"], seen: [], seenChains: [], cancelled: [], cancelledChains: [] },
+	]);
 	assert.deepEqual(parseClaims(`routr start --role start --model 5 x`, "6"), { ids: [6], chains: [], seen: [], seenChains: [], cancelled: [], cancelledChains: [] });
 });
 
 test("a bare number from another command in the same call is not claimed", () => {
 	assert.deepEqual(parseClaims(`routr start x && wc -l < notes.txt`, "7\n12\n").ids, []);
-	assert.deepEqual(parseClaims(`cd /w && routr start x`, "7\n").ids, [7]);
+	assert.deepEqual(parseClaims(`cd /w && routr start x`, "7\n").elsewhere?.[0]?.ids, [7]);
 	assert.deepEqual(parseClaims(`mkdir -p research; for t in a b; do routr start --role research "$t"; done`, "4\n5\n").ids, [4, 5]);
 	assert.deepEqual(parseClaims(`routr start --role task - <<'EOF'\nwc -l things\nEOF\nwc -l f`, "7\n3\n").ids, [], "command after a heredoc");
 	assert.deepEqual(parseClaims(`routr start --json x; echo 99`, JSON.stringify({ id: 7 })).ids, [7], "--json is exact");
@@ -209,4 +215,69 @@ test("routr help output claims nothing", () => {
 	// the real lines still claim
 	assert.deepEqual(parseClaims(`routr result 4`, "routr: worker 4 has no final message yet (running). Run: routr wait 4\n").ids, [4]);
 	assert.deepEqual(parseClaims(`routr wait auth-2`, "still running: 5 review (running). Run: routr wait auth-2\n").chains, ["auth-2"]);
+});
+
+// Ids are per registry: a claim says where it was made.
+const at = (place: object, c: Partial<Record<string, unknown>>) => ({ at: place, ids: [], chains: [], seen: [], seenChains: [], cancelled: [], cancelledChains: [], ...c });
+
+test("a queued line's registry note says where the worker is, wherever the call ran", () => {
+	const out = "routr: queued worker 141 task · codex (codex · gpt-5); registry /code/vp9enc-rs/.routr\n141\n";
+	assert.deepEqual(parseClaims(`cd /code/vp9enc-rs && routr start x`, out), { ...EMPTY_CLAIMS, elsewhere: [at({ registry: "/code/vp9enc-rs/.routr" }, { ids: [141] })] });
+	assert.deepEqual(parseClaims(`cd "$REPO" && routr start x`, out).elsewhere, [at({ registry: "/code/vp9enc-rs/.routr" }, { ids: [141] })], "the note even where only the shell knows the directory");
+	assert.deepEqual(parseClaims(`routr start x`, out).elsewhere, [at({ registry: "/code/vp9enc-rs/.routr" }, { ids: [141] })], "and in the session's own directory: the front end finds it is its own");
+	// flow start: each step's line, and the chain where they are
+	const flow = "routr: queued 3 plan · claude (claude) step plan; registry /o/.routr\nroutr: queued 4 review · codex (codex) step review; registry /o/.routr\nplan-2\n";
+	assert.deepEqual(parseClaims(`cd /o && routr flow start plan --task x`, flow).elsewhere, [at({ registry: "/o/.routr" }, { ids: [3, 4], chains: ["plan-2"] })]);
+	// a routr older than the note: where the call ran
+	assert.deepEqual(parseClaims(`cd /o && routr start x`, "routr: queued worker 9 task · claude (claude)\n9\n").elsewhere, [at({ cwd: "/o" }, { ids: [9] })]);
+});
+
+test("where a call runs: cd, --root, ROUTR_STATE_DIR", () => {
+	assert.deepEqual(parseClaims(`cd ../other && routr start x`, "5\n").elsewhere, [at({ cwd: "../other" }, { ids: [5] })]);
+	assert.deepEqual(parseClaims(`cd /a; cd b && routr start x`, "5\n").elsewhere, [at({ cwd: "/a/b" }, { ids: [5] })]);
+	assert.deepEqual(parseClaims(`cd ~/code/o && routr result 5`, "x").elsewhere, [at({ cwd: "~/code/o" }, { seen: [5] })]);
+	assert.deepEqual(parseClaims(`routr result 5 --root /o`, "x").elsewhere, [at({ root: "/o" }, { seen: [5] })]);
+	assert.deepEqual(parseClaims(`cd /a && routr result 5 --root ../o`, "x").elsewhere, [at({ root: "/a/../o" }, { seen: [5] })]);
+	assert.deepEqual(parseClaims(`ROUTR_STATE_DIR=/s routr send 5 more`, "").elsewhere, [at({ registry: "/s" }, { ids: [5] })]);
+	assert.deepEqual(parseClaims(`export ROUTR_STATE_DIR=/s; routr wait 5`, "Done.").elsewhere, [at({ registry: "/s" }, { seen: [5] })]);
+	assert.deepEqual(parseClaims(`cd /o && routr cancel 5`, "routr: cancelled 5 task · claude\n").elsewhere, [at({ cwd: "/o" }, { cancelled: [5] })]);
+	// a timed-out wait names the worker in the registry it waited on
+	assert.deepEqual(parseClaims(`cd /o && routr wait 5`, "still running: 5 task · claude (9m00s). Run: routr wait 5").elsewhere, [at({ cwd: "/o" }, { ids: [5] })]);
+	// a follow-up's line names its registry
+	assert.deepEqual(parseClaims(`routr send 5 more`, "routr: queued follow-up 2 for 5 task · claude; it goes into its tab; registry /o/.routr\n").elsewhere, [
+		at({ registry: "/o/.routr" }, { ids: [5] }),
+	]);
+	// --json records name theirs in run_dir
+	const rec = JSON.stringify({ id: 6, chain: "c1", state: "pending", run_dir: "/o/.routr/runs/6" });
+	assert.deepEqual(parseClaims(`routr start --json x`, rec).elsewhere, [at({ registry: "/o/.routr" }, { ids: [6], chains: ["c1"] })]);
+});
+
+test("a call where only the shell knows the directory claims nothing: no id is matched in the wrong registry", () => {
+	assert.deepEqual(parseClaims(`cd "$REPO" && routr start x`, "5\n"), EMPTY_CLAIMS);
+	assert.deepEqual(parseClaims(`cd - && routr result 5`, "x"), EMPTY_CLAIMS);
+	assert.deepEqual(parseClaims(`cd $(git rev-parse --show-toplevel)/../o && routr wait 5`, "x"), EMPTY_CLAIMS);
+	assert.deepEqual(parseClaims(`cd "$REPO" && cd /o && routr result 5`, "x").elsewhere, [at({ cwd: "/o" }, { seen: [5] })], "an absolute cd after it is known again");
+});
+
+test("places: what a front end resolves", () => {
+	assert.deepEqual(places(`cd /o && routr start x; routr result 3 --root /p`, "routr: queued worker 7 task · claude (claude); registry /q/.routr\n"), [
+		{ cwd: "/o" },
+		{ root: "/p" },
+		{ registry: "/q/.routr" },
+	]);
+	assert.deepEqual(places(`routr start x`, "7\n"), []);
+});
+
+test("a wait cover says where it waits", () => {
+	assert.deepEqual(waitCover(`routr wait 3`), { ids: [3], chains: [], fresh: false });
+	assert.deepEqual(waitCover(`cd /o && routr wait 3; routr wait c2 --root /p`), {
+		ids: [],
+		chains: [],
+		fresh: false,
+		elsewhere: [
+			{ at: { cwd: "/o" }, ids: [3], chains: [] },
+			{ at: { root: "/p" }, ids: [], chains: ["c2"] },
+		],
+	});
+	assert.deepEqual(waitCover(`cd "$X" && routr wait 3`), { ids: [], chains: [], fresh: false }, "where only the shell knows: nothing");
 });

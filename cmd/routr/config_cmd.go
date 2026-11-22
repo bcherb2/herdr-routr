@@ -41,7 +41,7 @@ func (a *app) configCmd(args []string) error {
 		_, err := fmt.Fprint(a.stdout, config.Example)
 		return err
 	case "init":
-		created, err := writeNew(user, config.Example)
+		created, err := a.initConfig()
 		if err != nil {
 			return err
 		}
@@ -75,6 +75,12 @@ func (a *app) configCmd(args []string) error {
 		fmt.Fprintf(tw, "%s\t%s\t%s\n", k.name, files[k.name].Path, note)
 	}
 	return tw.Flush()
+}
+
+// initConfig writes the commented template as the user config unless one
+// exists, and reports whether it did.
+func (a *app) initConfig() (bool, error) {
+	return writeNew(userConfig(a.getenv), config.Example)
 }
 
 // writeNew writes text to path, creating its directory, unless path exists.

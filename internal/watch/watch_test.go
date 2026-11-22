@@ -883,3 +883,29 @@ func TestGivingUpOnAReplyClearsRetries(t *testing.T) {
 		t.Errorf("retry state kept: %+v", w)
 	}
 }
+
+// Worker 200: its question was dismissed in its tab, and it went idle with an
+// empty reply. maybe_done says so, and names the question that went
+// unanswered, until it works again.
+func TestIdleAfterAQuestionWentUnanswered(t *testing.T) {
+	r := newRig(t)
+	id := r.add(registry.Worker{Brief: "go"})
+	r.tick(1)
+	r.fake.Ask(id, "Do you want to proceed?\n1. Yes\n2. No", "Yes", "No")
+	r.settle()
+	r.state(id, registry.Blocked)
+	r.fake.Finish(id, "") // Esc in its tab: the turn ends with nothing said
+	r.settle()
+	w := r.state(id, registry.MaybeDone)
+	if w.Unanswered != "Do you want to proceed?" || w.Question != "" {
+		t.Errorf("unanswered = %q, question = %q", w.Unanswered, w.Question)
+	}
+	if !strings.Contains(w.Note, "its question went unanswered") || !strings.Contains(w.Note, "its last reply was empty") || strings.Contains(w.Note, "has its last reply") {
+		t.Errorf("note = %q", w.Note)
+	}
+	r.fake.SetPhase(id, worker.Working)
+	r.settle()
+	if w := r.state(id, registry.Running); w.Unanswered != "" {
+		t.Errorf("working again keeps %q", w.Unanswered)
+	}
+}

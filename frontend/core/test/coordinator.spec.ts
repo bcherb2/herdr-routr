@@ -4,6 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Coordinator, type CoordinatorOptions } from "../coordinator.ts";
+import type { Place } from "../claims.ts";
 import type { State, Worker } from "../model.ts";
 import type { WakeItem } from "../wake.ts";
 
@@ -151,7 +152,7 @@ test("news a cancel made moot while results were fetched is not composed; a fini
 		"fetch the result of what finished",
 	);
 	c.shellEnded("t1", "routr cancel 5", "routr: cancelled 5 task · claude\n");
-	const wake = c.compose(items, new Map([[6, "All done."]]), none)!;
+	const wake = c.compose(items, new Map([["6", "All done."]]), none)!;
 	assert.match(wake.message.content, /worker 6/);
 	assert.doesNotMatch(wake.message.content, /worker 5/);
 	assert.equal(wake.intoTurn, false, "no turn runs: a turn of its own");
@@ -213,7 +214,7 @@ test("after the session ends, nothing fetched for it is composed", () => {
 	c.snapshot([worker(5, "running")]);
 	const items = c.snapshot([worker(5, "done")]).wake;
 	c.end();
-	assert.equal(c.compose(items, new Map([[5, "Done."]]), none), undefined);
+	assert.equal(c.compose(items, new Map([["5", "Done."]]), none), undefined);
 	assert.deepEqual(c.snapshot([worker(5, "done"), worker(6, "done")]), { wake: [], keep: [] });
 });
 
@@ -289,4 +290,136 @@ test("while the front end compacts the model's context, news waits, a question t
 	assert.equal(c.resume(), true, "take a snapshot soon");
 	assert.deepEqual(ids(c.snapshot([worker(1, "done"), worker(2, "blocked", { question: "ok?" })]).wake), ["1:done", "2:blocked"]);
 	assert.equal(c.resume(), false, "nothing held");
+});
+
+// The model queued workers in another repo's registry (cd ../other && routr start …).
+// Ids are per registry: the coordinator knows each worker by both.
+const HOME = "/code/acksys-tool/.routr";
+const OTHER = "/code/vp9enc-rs/.routr";
+const queued = (id: number, reg = OTHER) => `routr: queued worker ${id} task · claude (claude); registry ${reg}\n${id}\n`;
+const keys = (items: readonly WakeItem[]): string[] => items.map((i) => `${i.worker.registry ?? ""}#${i.worker.id}:${i.kind}`);
+
+test("a worker queued in another repo's registry is listed there and wakes the model; the same id at home does not", () => {
+	const { c } = setup({ home: HOME });
+	c.snapshot([worker(141, "running", { callerSession: "other" })]); // home's own 141, another session's
+	c.turnStarted();
+	assert.deepEqual(c.elsewhere(), []);
+	const keep = c.shellEnded("t1", "cd /code/vp9enc-rs && routr start x", queued(141));
+	assert.deepEqual(keep, [{ ids: [141], chains: [], group: "run:1", registry: OTHER }], "kept with its registry");
+	c.turnEnded();
+	assert.deepEqual(c.elsewhere(), [OTHER], "listed: it holds a claim");
+	const theirs = worker(141, "running", { callerSession: undefined });
+	assert.deepEqual(c.snapshot([{ ...worker(141, "done", { callerSession: "other" }) }]).wake, [], "home's 141 is not this session's");
+	assert.deepEqual(c.snapshot([theirs], OTHER).wake, []);
+	assert.equal(c.isMine({ ...theirs, registry: OTHER }), true);
+	assert.equal(c.isMine(worker(141, "running", { callerSession: undefined })), false, "the id alone matches nothing");
+	assert.deepEqual(c.workers.map((w) => `${w.registry ?? ""}#${w.id}`), ["#141", `${OTHER}#141`]);
+	const out = c.snapshot([{ ...theirs, state: "done" }], OTHER);
+	assert.deepEqual(keys(out.wake), [`${OTHER}#141:done`]);
+	assert.deepEqual(c.elsewhere(), [], "nothing at work there: no more lists");
+	// a follow-up lists it again
+	c.shellEnded("t2", "cd /code/vp9enc-rs && routr send 141 more", "routr: queued follow-up 1 for 141 task · claude; it goes into its tab; registry /code/vp9enc-rs/.routr\n");
+	assert.deepEqual(c.elsewhere(), [OTHER]);
+});
+
+test("another repo's first list wakes for what the session queued there, already finished; the rest is a baseline", () => {
+	const { c } = setup({ home: HOME });
+	c.snapshot([]);
+	c.shellEnded("t1", "cd /code/vp9enc-rs && routr start --run 'go test' ", queued(7));
+	const out = c.snapshot([worker(6, "done", { callerSession: S }), worker(7, "done", { callerSession: undefined })], OTHER);
+	assert.deepEqual(keys(out.wake), [`${OTHER}#7:done`], "6 finished before: shown, not woken for");
+});
+
+// The model's shell hid the "queued" lines (ID=$(routr start … 2>log); echo "x=$ID $(cat log)"):
+// only the place the call ran says where its workers are, and routr's caller.session whose they are.
+test("a start in another repo whose output names no worker still lists that registry, and wakes for this session's workers there", () => {
+	const locate = (at: Place) => ("cwd" in at && at.cwd === "/code/vp9enc-rs" ? OTHER : undefined);
+	const { c, tick } = setup({ home: HOME, locate });
+	c.snapshot([]);
+	c.turnStarted();
+	tick(1000);
+	const hidden = `cxd=1 routr: queued worker 1 cxd · claude (claude); registry ${OTHER}\n`;
+	const keep = c.shellEnded("t1", 'cd /code/vp9enc-rs && ID=$(routr start --cwd x - < b.md 2>/tmp/e); echo "cxd=$ID $(cat /tmp/e)"', hidden);
+	assert.deepEqual(keep, [{ ids: [], chains: [], group: "run:1", registry: OTHER }], "the registry is kept, to list it after a restart");
+	c.turnEnded();
+	assert.deepEqual(c.elsewhere(), [OTHER]);
+	const mine = worker(1, "running", { created: T0 + 1000 });
+	const theirs = worker(2, "running", { created: T0 + 1000, callerSession: "other" });
+	assert.deepEqual(c.snapshot([mine, theirs], OTHER).wake, []);
+	assert.deepEqual(c.elsewhere(), [OTHER], "listed while this session's worker is at work there");
+	const out = c.snapshot([{ ...mine, state: "done" }, { ...theirs, state: "done" }], OTHER);
+	assert.deepEqual(keys(out.wake), [`${OTHER}#1:done`], "routr recorded this session as 1's caller; 2 is another's");
+	assert.deepEqual(c.elsewhere(), []);
+	// the same command again lists it again, though it is no longer new
+	assert.deepEqual(c.shellEnded("t2", "cd /code/vp9enc-rs && routr start y >/dev/null 2>&1", ""), []);
+	assert.deepEqual(c.elsewhere(), [OTHER]);
+});
+
+test("another repo's first list wakes for a worker routr says this session started during a turn, though it finished already", () => {
+	const locate = (at: Place) => ("cwd" in at && at.cwd === "/code/vp9enc-rs" ? OTHER : undefined);
+	const { c, tick } = setup({ home: HOME, locate });
+	c.snapshot([]);
+	c.turnStarted();
+	tick(1000);
+	c.shellEnded("t1", "cd /code/vp9enc-rs && routr start --run 'go test' >/dev/null 2>&1", "");
+	c.turnEnded();
+	const out = c.snapshot([worker(6, "done", { created: T0 - 60_000 }), worker(7, "done", { created: T0 + 1000 })], OTHER);
+	assert.deepEqual(keys(out.wake), [`${OTHER}#7:done`], "6 is from before this session's first turn: a baseline");
+});
+
+test("claims at a place go where locate says; one it can't tell is dropped; one at home is home's", () => {
+	const locate = (at: Place) => ("cwd" in at ? ({ "/code/vp9enc-rs": OTHER, sub: HOME } as Record<string, string>)[at.cwd] : undefined);
+	const { c } = setup({ home: HOME, locate });
+	c.snapshot([worker(5, "running", { callerSession: undefined })]);
+	c.shellEnded("t1", "cd /code/vp9enc-rs && routr start x", "5\n");
+	assert.equal(c.isMine(worker(5, "running", { callerSession: undefined })), false);
+	assert.equal(c.isMine(worker(5, "running", { callerSession: undefined, registry: OTHER })), true);
+	c.shellEnded("t2", "cd /nowhere && routr start x", "6\n");
+	assert.equal(c.isMine(worker(6, "running", { callerSession: undefined })), false, "dropped, not matched at home");
+	assert.deepEqual(c.elsewhere(), [OTHER]);
+	c.shellEnded("t3", "cd sub && routr start x", "8\n");
+	assert.equal(c.isMine(worker(8, "running", { callerSession: undefined })), true, "a subdirectory of the same repo");
+});
+
+test("a wait, a read and a cancel in another repo count there, not at home", () => {
+	const { c } = setup({ home: HOME });
+	c.snapshot([worker(5, "running")]);
+	c.shellEnded("t0", "cd /code/vp9enc-rs && routr start x", queued(5));
+	c.snapshot([worker(5, "running")], OTHER);
+	c.shellStarted("t1", "routr wait 5 --root /code/vp9enc-rs");
+	const both = () => {
+		const a = c.snapshot([worker(5, "done")]).wake;
+		return [...a, ...c.snapshot([worker(5, "done")], OTHER).wake];
+	};
+	assert.deepEqual(keys(both()), ["#5:done"], "the wait covers the other repo's 5 only");
+	c.shellEnded("t1", "routr wait 5 --root /code/vp9enc-rs", "Done.\n");
+	assert.deepEqual(keys(both()), [], "it returned it");
+	// a cancel there drops that one's news only
+	c.snapshot([worker(9, "running")]);
+	c.shellEnded("t2", "cd /code/vp9enc-rs && routr start x", queued(9));
+	c.snapshot([worker(9, "running")], OTHER);
+	c.shellEnded("t3", "routr cancel 9 --root /code/vp9enc-rs", "routr: cancelled 9 task · claude\n");
+	const home = c.snapshot([worker(9, "blocked", { question: "ok?" })]).wake;
+	assert.deepEqual(keys(home), ["#9:blocked"]);
+});
+
+test("claims kept with another repo's registry are handed back after a restart, and listed once", () => {
+	const c = new Coordinator({ sessionId: S, home: HOME, restored: [{ ids: [3], chains: ["c1"], group: "run:1", registry: OTHER }] });
+	assert.deepEqual(c.elsewhere(), [OTHER]);
+	assert.equal(c.isMine(worker(3, "done", { callerSession: undefined, registry: OTHER })), true);
+	assert.equal(c.isMine(worker(3, "done", { callerSession: undefined })), false);
+	assert.equal(c.isMine(worker(4, "done", { callerSession: undefined, chain: "c1", registry: OTHER })), true);
+	c.snapshot([]);
+	assert.deepEqual(c.snapshot([worker(3, "done", { callerSession: undefined })], OTHER).wake, [], "finished before the restart: a baseline");
+	assert.deepEqual(c.elsewhere(), []);
+});
+
+test("another repo's chain is told from a chain of the same name at home", () => {
+	const { c } = setup({ home: HOME });
+	c.snapshot([worker(2, "running", { callerSession: "other", chain: "plan-1" })]);
+	c.shellEnded("t1", "cd /code/vp9enc-rs && routr flow start plan --task x", `routr: queued 2 plan · claude (claude) step plan; registry ${OTHER}\nplan-1\n`);
+	assert.equal(c.isMine(worker(2, "running", { callerSession: "other", chain: "plan-1" })), false);
+	assert.equal(c.isMine(worker(2, "running", { callerSession: "other", chain: "plan-1", registry: OTHER })), true);
+	assert.equal(c.group(worker(2, "running", { chain: "plan-1", registry: OTHER })), `chain:${OTHER}#plan-1`);
+	assert.equal(c.group(worker(2, "running", { chain: "plan-1" })), "chain:plan-1");
 });

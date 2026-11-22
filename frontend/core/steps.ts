@@ -2,7 +2,7 @@
 // row per step, a foreach step's copies folded into one "×N" row. The other
 // view is the cards in model.ts; both read the same `routr list --json`.
 
-import { ACTIVE, age, engine, FINISHED, NEEDS_PERSON, note, tone, visible, type Paint, type Tone, type Worker } from "./model.ts";
+import { ACTIVE, age, engine, FINISHED, NEEDS_PERSON, note, refKey, repoTag, tone, visible, workerKey, type Paint, type Tone, type Worker } from "./model.ts";
 
 export interface StepRow {
 	name: string;
@@ -23,7 +23,7 @@ export interface StepRow {
 }
 
 export interface StepBlock {
-	/** the chain, or undefined for workers started on their own */
+	/** the chain ("oauth-3 @vp9enc-rs" for another repo's), or undefined for workers started on their own */
 	chain?: string;
 	rows: StepRow[];
 	tone: Tone;
@@ -41,7 +41,8 @@ export interface StepOptions {
 	answerHint: string;
 	/** the agent run a worker was started in: ad hoc workers of one role started together share a row */
 	group?: (w: Worker) => string | undefined;
-	activity?: ReadonlyMap<number, readonly string[]>;
+	/** recent activity lines per worker (workerKey) */
+	activity?: ReadonlyMap<string, readonly string[]>;
 }
 
 /** Rolled up over copies: a person first, then work in progress, then how it ended. */
@@ -89,7 +90,7 @@ function toRow(name: string, all: readonly Worker[], o: StepOptions): StepRow {
 	if (copies === 0) details.push("no files matched");
 	// a done step's verdict is in its details already
 	const noted = ws.find((w) => tone(w) === t && w.state !== "done" && note(w, o.answerHint) !== undefined);
-	const acts = one && (ACTIVE.has(one.state) || one.state === "blocked") ? (o.activity?.get(one.id) ?? []) : [];
+	const acts = one && (ACTIVE.has(one.state) || one.state === "blocked") ? (o.activity?.get(workerKey(one)) ?? []) : [];
 	return {
 		name,
 		copies,
@@ -126,30 +127,32 @@ export function toSteps(workers: readonly Worker[], o: StepOptions): StepBlock[]
 	const byId = [...workers].sort((a, b) => a.id - b.id);
 	const chains = new Map<string, Map<string, Worker[]>>();
 	const adhoc = new Map<string, Worker[]>();
+	// chain names and ids are per registry: another repo's are kept apart, and tagged with it
 	for (const w of byId) {
 		if (w.chain) {
-			const steps = chains.get(w.chain) ?? new Map<string, Worker[]>();
-			chains.set(w.chain, steps);
+			const chain = refKey(w.registry, w.chain);
+			const steps = chains.get(chain) ?? new Map<string, Worker[]>();
+			chains.set(chain, steps);
 			const name = w.step ?? w.title ?? w.role;
 			steps.set(name, [...(steps.get(name) ?? []), w]);
 		} else if (visible(w, o.now, o.lingerMs)) {
-			const name = w.title ?? w.role;
+			const name = `${w.title ?? w.role}${repoTag(w)}`;
 			const run = o.group?.(w);
-			const key = run ? `${run}\u0000${name}` : `alone:${w.id}`;
+			const key = run ? `${run}\u0000${name}` : `alone:${workerKey(w)}`;
 			adhoc.set(key, [...(adhoc.get(key) ?? []), w]);
 		}
 	}
 	const blocks: StepBlock[] = [];
-	for (const [chain, steps] of chains) {
+	for (const steps of chains.values()) {
 		const ws = [...steps.values()].flat();
-		if (ws.some((w) => visible(w, o.now, o.lingerMs))) blocks.push(toBlock(chain, steps, o));
+		if (ws.some((w) => visible(w, o.now, o.lingerMs))) blocks.push(toBlock(`${ws[0]!.chain}${repoTag(ws[0]!)}`, steps, o));
 	}
 	blocks.sort((a, b) => rank(a) - rank(b));
 	if (adhoc.size > 0) {
 		// one worker: "12 research", as on its card; a group: "research", with ×N
 		const rows = new Map<string, Worker[]>();
 		for (const ws of adhoc.values()) {
-			const name = ws[0]!.title ?? ws[0]!.role;
+			const name = `${ws[0]!.title ?? ws[0]!.role}${repoTag(ws[0]!)}`;
 			rows.set(ws.length === 1 || rows.has(name) ? `${ws[0]!.id} ${name}` : name, ws);
 		}
 		blocks.push(toBlock(undefined, rows, o));

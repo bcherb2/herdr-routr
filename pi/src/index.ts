@@ -4,8 +4,9 @@
 // Everything goes through the routr CLI (`list --json`, `result`, `answer`,
 // …); the registry is only watched for changes, never read.
 
-import { existsSync, readFileSync, watch, type FSWatcher } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, readFileSync, realpathSync, watch, type FSWatcher } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -32,8 +33,10 @@ import {
 	toCards,
 	toSteps,
 	waiting,
+	workerKey,
 	type ClaimsEntry,
 	type Paint,
+	type Place,
 	type QuestionContext,
 	type Tone,
 	type TurnEnd,
@@ -43,9 +46,9 @@ import {
 	type Worker,
 } from "../../frontend/core/index.ts";
 import { readMain, runRoutr, staleBinary, type Stale } from "./cli.ts";
-import { due, summaryInstructions, truncation } from "./compaction.ts";
+import { atBudget, due, keptHead, piCompacts, summaryInstructions, truncation, type TruncationDetails } from "./compaction.ts";
 import { Chain, failure, modelName, parseFallback, piRef, type Failure } from "./fallback.ts";
-import { mainFromEnv, stripOldReasoning, type MainAgent } from "./context.ts";
+import { mainFromEnv, markHeadEnd, stripOldReasoning, type MainAgent } from "./context.ts";
 import { ANSWER_KEY, chooser, questionPicker } from "./dialogs.ts";
 import { LineTail } from "./tail.ts";
 
@@ -60,8 +63,10 @@ const CLAIMS_TYPE = "routr-claims";
 const FALLBACK_TYPE = "routr-fallback";
 /** a fallback model whose window this share of is already used gets the context cut first */
 const FIT = 0.8;
-/** and is cut to at most this share of it */
+/** and is cut to at most this share of it; so is a context that overflowed its window */
 const FIT_KEEP = 0.5;
+/** a context still over this share of [main] at after a cut is said to be */
+const STILL_BIG = 0.8;
 
 const POLL_BUSY_MS = 1500;
 const POLL_IDLE_MS = 5000;
@@ -94,6 +99,36 @@ function routrDir(cwd: string): string {
 	}
 }
 
+/** One path for one directory however it was written (a symlink, a trailing slash), so registries compare. */
+function canon(dir: string): string {
+	try {
+		return realpathSync(dir);
+	} catch {
+		return resolve(dir); // not made yet
+	}
+}
+
+/**
+ * The registry a routr call at `at` keeps its workers in (claims.ts Place),
+ * by the CLI's rule, against the session's cwd; undefined for a path the
+ * shell would expand (`~user`). Each place is resolved once.
+ */
+function locator(cwd: string): (at: Place) => string | undefined {
+	const seen = new Map<string, string | undefined>();
+	const path = (p: string): string | undefined => {
+		if (p === "~" || p.startsWith("~/")) return join(homedir(), p.slice(1));
+		return p.startsWith("~") ? undefined : resolve(cwd, p);
+	};
+	return (at) => {
+		const k = JSON.stringify(at);
+		if (!seen.has(k)) {
+			const p = path("registry" in at ? at.registry : "root" in at ? at.root : at.cwd);
+			seen.set(k, p === undefined ? undefined : canon("registry" in at ? p : "root" in at ? join(p, ".routr") : routrDir(p)));
+		}
+		return seen.get(k);
+	};
+}
+
 function skillPaths(): string[] {
 	if (process.env.ROUTR_PI_SKILL === "0") return [];
 	// packaged copy first (pi/skills/routr), then the repo's (../skills/routr)
@@ -106,6 +141,17 @@ function skillPaths(): string[] {
 function wakeModeFromEnv(): WakeMode {
 	const v = process.env.ROUTR_PI_WAKE;
 	return v === "all" || v === "off" ? v : "mine";
+}
+
+/**
+ * The main agent asks for Pi's long prompt cache (an hour on Anthropic models)
+ * unless PI_CACHE_RETENTION is set (PI_CACHE_RETENTION=short keeps 5
+ * minutes). It waits on its workers, often past 5 minutes, and a turn after
+ * the cache expired re-sends the whole conversation uncached. Pi reads the
+ * variable on every request; a worker's tab gets its own environment.
+ */
+function keepCacheLonger(env: NodeJS.ProcessEnv = process.env): void {
+	if (!env.ROUTR_ID && !env.PI_CACHE_RETENTION) env.PI_CACHE_RETENTION = "long";
 }
 
 function viewFromEnv(): View {
@@ -140,6 +186,7 @@ function painter(theme: ExtensionContext["ui"]["theme"]): Paint {
 }
 
 export default function routr(pi: ExtensionAPI): void {
+	keepCacheLonger();
 	// Per-session state; reset in session_start.
 	let ctx: ExtensionContext | undefined;
 	let cwd = process.cwd();
@@ -151,7 +198,7 @@ export default function routr(pi: ExtensionAPI): void {
 	let engaged = false; // this repo has a registry, or the session ran routr
 	let missing = false;
 	let lastError = "";
-	const tails = new Map<number, { tail: LineTail; harness: string; lines: string[] }>();
+	const tails = new Map<string, { tail: LineTail; harness: string; lines: string[] }>(); // by workerKey
 	let pollTimer: NodeJS.Timeout | undefined;
 	let tailTimer: NodeJS.Timeout | undefined;
 	let watcher: FSWatcher | undefined;
@@ -170,7 +217,9 @@ export default function routr(pi: ExtensionAPI): void {
 	let compacting = false;
 	let waking = 0; // wakes being fetched and sent: a compaction would abort the turn one starts
 	let toldTooSmall = false; // Pi refused a cut for keepRecentTokens: said once a session
-	/** the context size Pi last refused to cut at: the next try waits until it has grown a tenth */
+	let cutCheck = false; // a routr cut is done: the next answer's prompt size tells whether at leaves room
+	let toldStillBig = false; // the context after a cut was close to at: said once a session
+	/** the context size Pi last refused to cut at, or a cut left over at: the next try waits until it has grown a tenth */
 	let refusedAt = 0;
 	let interrupted = false; // the user's Esc ended the last run: they are about to type
 	/** this cut truncates whatever [main] context says, keeping at most this many tokens: the context must fit a fallback model's window */
@@ -213,13 +262,14 @@ export default function routr(pi: ExtensionAPI): void {
 	}
 
 	function syncTails(): void {
-		const want = new Set<number>();
+		const want = new Set<string>();
 		for (const w of coord.workers) {
 			if (!w.transcript || !(ACTIVE.has(w.state) || w.state === "blocked")) continue;
-			want.add(w.id);
-			const cur = tails.get(w.id);
+			const k = workerKey(w);
+			want.add(k);
+			const cur = tails.get(k);
 			if (!cur || cur.tail.path !== w.transcript) {
-				tails.set(w.id, { tail: new LineTail(w.transcript), harness: w.harness, lines: [] });
+				tails.set(k, { tail: new LineTail(w.transcript), harness: w.harness, lines: [] });
 			}
 		}
 		for (const id of tails.keys()) if (!want.has(id)) tails.delete(id);
@@ -314,6 +364,15 @@ export default function routr(pi: ExtensionAPI): void {
 			if (dialog && !stillAsked(dialog.shown, workers)) dialog.abort.abort();
 			const c = coord;
 			const { wake: items, keep } = c.snapshot(workers);
+			// and the other repos' registries the model queued this session's workers in, while they are at work
+			for (const reg of c.elsewhere()) {
+				const o = await listElsewhere(reg);
+				if (mine !== gen) return;
+				if (!o) continue;
+				const out = c.snapshot(o, reg);
+				items.push(...out.wake);
+				keep.push(...out.keep);
+			}
 			for (const k of keep) pi.appendEntry<ClaimsEntry>(CLAIMS_TYPE, k);
 			syncTails();
 			if (items.length > 0) {
@@ -347,8 +406,22 @@ export default function routr(pi: ExtensionAPI): void {
 		}
 	}
 
+	/** `routr list --json` of another repo's registry; undefined when it failed (said once per error). */
+	async function listElsewhere(reg: string): Promise<Worker[] | undefined> {
+		const r = await runRoutr(["list", "--json"], cwd, undefined, reg);
+		try {
+			if (r.code === 0) return parseList(r.stdout);
+		} catch {
+			// told below
+		}
+		const err = `routr list in ${reg} failed: ${(r.stderr || r.stdout).trim().split("\n")[0] ?? ""}`;
+		if (err !== lastError) ui((c) => c.ui.notify(err, "warning"));
+		lastError = err;
+		return undefined;
+	}
+
 	async function resultText(w: Worker): Promise<string> {
-		const r = await runRoutr(["result", String(w.id)], cwd);
+		const r = await runRoutr(["result", String(w.id)], cwd, undefined, w.registry);
 		if (r.code === 0 && r.stdout.trim()) return r.stdout;
 		if (w.finalPath) {
 			try {
@@ -362,19 +435,19 @@ export default function routr(pi: ExtensionAPI): void {
 
 	/** What a question the model answers is decided with; undefined if routr could not say (the wake names the command). */
 	async function questionContext(w: Worker): Promise<QuestionContext | undefined> {
-		const r = await runRoutr(["show", String(w.id), "--context", "--json"], cwd);
+		const r = await runRoutr(["show", String(w.id), "--context", "--json"], cwd, undefined, w.registry);
 		return r.code === 0 ? parseContext(r.stdout) : undefined;
 	}
 
 	async function wake(c: Coordinator, items: WakeItem[]): Promise<void> {
 		const want = c.wants(items);
-		const results = new Map<number, string>();
-		const contexts = new Map<number, QuestionContext>();
+		const results = new Map<string, string>();
+		const contexts = new Map<string, QuestionContext>();
 		await Promise.all([
-			...want.results.map(async (w) => results.set(w.id, await resultText(w))),
+			...want.results.map(async (w) => results.set(workerKey(w), await resultText(w))),
 			...want.contexts.map(async (w) => {
 				const q = await questionContext(w);
-				if (q) contexts.set(w.id, q);
+				if (q) contexts.set(workerKey(w), q);
 			}),
 		]);
 		// once sent, Pi queues it until the model's turn allows, and nothing recalls it from there
@@ -462,9 +535,9 @@ export default function routr(pi: ExtensionAPI): void {
 		schedule(100);
 	}
 
-	/** This session's workers, as the note or the summary names them: a fresh list, else the last one. */
+	/** This session's workers, as the note or the summary names them: a fresh list, else the last one; other repos' from the last. */
 	async function mineWorkers(): Promise<Worker[]> {
-		let workers = coord.workers;
+		let workers = coord.workers.filter((w) => !w.registry);
 		const r = await runRoutr(["list", "--json"], cwd);
 		if (r.code === 0 && !r.missing) {
 			try {
@@ -473,7 +546,7 @@ export default function routr(pi: ExtensionAPI): void {
 				// the last snapshot's
 			}
 		}
-		return workers.filter((w) => coord.isMine(w));
+		return [...workers, ...coord.workers.filter((w) => w.registry)].filter((w) => coord.isMine(w));
 	}
 
 	/** Our compaction is over, however it ended: the news it held goes. */
@@ -487,7 +560,8 @@ export default function routr(pi: ExtensionAPI): void {
 	/**
 	 * Cut the main agent's context now, wakes held until it is over; then
 	 * `then`, however it ended (before wakes go). `keep`: truncate whatever
-	 * [main] context says, keeping at most that many tokens.
+	 * [main] context says, to at most that many tokens, the first turn kept
+	 * in front of the note and the note included.
 	 */
 	function cut(c: ExtensionContext, tokens: number, opts: { customInstructions?: string; keep?: number; then?: () => void } = {}): void {
 		const mine = gen;
@@ -503,7 +577,9 @@ export default function routr(pi: ExtensionAPI): void {
 			onComplete: (r) => {
 				if (mine !== gen) return;
 				done();
-				const after = r.estimatedTokensAfter === undefined ? "" : ` to about ${r.estimatedTokensAfter}`;
+				// Pi's estimate leaves out the first turn routr sends in front of the note
+				const head = (r.details as TruncationDetails | undefined)?.head?.tokens ?? 0;
+				const after = r.estimatedTokensAfter === undefined ? "" : ` to about ${r.estimatedTokensAfter + head}`;
 				ui((u) => u.ui.notify(`routr: cut the context from ${r.tokensBefore}${after} tokens`, "info"));
 			},
 			onError: (e) => {
@@ -515,7 +591,7 @@ export default function routr(pi: ExtensionAPI): void {
 					refusedAt = tokens;
 					if (toldTooSmall) return;
 					toldTooSmall = true;
-					const keep = pi.getSettings?.().compaction?.keepRecentTokens ?? 20_000;
+					const keep = keepRecent(c.model);
 					return ui((u) =>
 						u.ui.notify(`routr: nothing to cut yet: Pi always keeps the last ${keep} tokens of conversation (compaction.keepRecentTokens), and [main] at counts the system prompt too`, "warning"),
 					);
@@ -523,6 +599,12 @@ export default function routr(pi: ExtensionAPI): void {
 				ui((u) => u.ui.notify(`routr: could not cut the context: ${e.message}`, "warning"));
 			},
 		});
+	}
+
+	/** Pi's compaction.keepRecentTokens for model, as its settings resolve it: the model's override, the setting, Pi's default. */
+	function keepRecent(model: { provider: string; id: string } | undefined): number {
+		const s = pi.getSettings?.().compaction as { keepRecentTokens?: number; modelOverrides?: Record<string, { keepRecentTokens?: number } | undefined> } | undefined;
+		return (model && s?.modelOverrides?.[`${model.provider}/${model.id}`]?.keepRecentTokens) ?? s?.keepRecentTokens ?? 20_000;
 	}
 
 	/** The model failed and nothing took over: say so, and hold wakes (each would fail the same way) until the user's next turn. */
@@ -624,6 +706,8 @@ export default function routr(pi: ExtensionAPI): void {
 		gen++;
 		compacting = false;
 		toldTooSmall = false;
+		cutCheck = false;
+		toldStillBig = false;
 		refusedAt = 0;
 		interrupted = false;
 		forceKeep = undefined;
@@ -664,6 +748,8 @@ export default function routr(pi: ExtensionAPI): void {
 			wakeMode,
 			maxHoldMs: holdFromEnv(process.env.ROUTR_WAKE_HOLD),
 			restored,
+			home: canon(dotRoutr),
+			locate: locator(cwd),
 		});
 		tails.clear();
 		missing = false;
@@ -717,14 +803,27 @@ export default function routr(pi: ExtensionAPI): void {
 			permissions;
 	});
 
-	// The main agent only: a worker's reasoning is about the code it is changing.
-	// Chat Completions only, where reasoning is plain text billed as input
-	// (DeepSeek, OpenRouter): the Responses APIs pair each earlier tool call with
-	// its reasoning item by id, and Anthropic already ignores earlier turns'.
+	// The main agent only: a worker's context is its work. After a truncation
+	// that kept the session's first turn, that turn goes back in front of the
+	// note (Pi's context then starts with the note; its system message is
+	// Pi's, put first again). Then earlier turns' reasoning goes, for Chat
+	// Completions only, where it is plain text billed as input (DeepSeek,
+	// OpenRouter): the Responses APIs pair each earlier tool call with its
+	// reasoning item by id, and Anthropic already ignores earlier turns'.
 	pi.on("context", async (event, c) => {
-		if (process.env.ROUTR_ID || c.model?.api !== "openai-completions" || !(await main).strip_reasoning) return;
-		const messages = stripOldReasoning(event.messages);
-		return messages && { messages };
+		if (process.env.ROUTR_ID) return;
+		const head = event.messages[0]?.role === "compactionSummary" ? keptHead(c.sessionManager.getBranch()) : undefined;
+		let messages = head ? [...head, ...event.messages] : event.messages;
+		if (c.model?.api === "openai-completions" && (await main).strip_reasoning) messages = stripOldReasoning(messages) ?? messages;
+		return messages === event.messages ? undefined : { messages };
+	});
+
+	// The first turn kept in front of the note gets its own cache breakpoint
+	// on Anthropic (context.ts, markHeadEnd), so each cut writes only the note
+	// and the turns after it.
+	pi.on("before_provider_request", (event, c) => {
+		if (process.env.ROUTR_ID || c.model?.api !== "anthropic-messages") return;
+		return markHeadEnd(event.payload);
 	});
 
 	// The main agent's context past [main] at, once its run has settled: cut
@@ -745,8 +844,15 @@ export default function routr(pi: ExtensionAPI): void {
 		const m = await main;
 		const tokens = c.getContextUsage()?.tokens;
 		if (!due(m, tokens) || tokens! < refusedAt * 1.1 || !c.isIdle() || c.hasPendingMessages() || waking > 0 || compacting) return;
-		// a dry run: nothing older than the turns kept, nothing to ask Pi for
-		if (m.context === "truncate" && !truncation(c.sessionManager.getBranch(), m, { tokensBefore: 0, workers: [] })) return;
+		// a dry run: nothing older than the turns kept, nothing to ask Pi for; nor while Pi would refuse it (refusedAt is for when it does anyway)
+		try {
+			const branch = c.sessionManager.getBranch();
+			if (m.context === "truncate" && !truncation(branch, m, { tokensBefore: 0, workers: [], budget: atBudget(branch, m, tokens) })) return;
+			if (!piCompacts(branch, keepRecent(c.model))) return;
+		} catch (e) {
+			ui((u) => u.ui.notify(`routr: could not cut the context: ${e instanceof Error ? e.message : String(e)}`, "warning"));
+			return;
+		}
 		compacting = true; // claimed before the awaits below; cut() takes it over
 		coord.pause();
 		const mine = gen;
@@ -768,21 +874,46 @@ export default function routr(pi: ExtensionAPI): void {
 	// [main] context's way: truncate answers with a note and the last turns,
 	// no model call; summarize leaves it to Pi's summary. The user's /compact
 	// is Pi's summary. Nothing for a worker.
-	pi.on("session_before_compact", async (event) => {
+	pi.on("session_before_compact", async (event, c) => {
 		if (process.env.ROUTR_ID) return;
 		const ours = compacting && event.reason === "manual";
 		if (event.reason === "manual" && !ours) return;
 		const m = await main;
 		const forced = ours ? forceKeep : undefined;
 		if (m.context !== "truncate" && forced === undefined) return;
-		const keep = forced === undefined ? m : { ...m, keep_tokens: m.keep_tokens === -1 ? forced : Math.min(m.keep_tokens, forced) };
-		const compaction = truncation(event.branchEntries, keep, { tokensBefore: event.preparation.tokensBefore, workers: await mineWorkers() });
+		// a cut that must fit a window holds the first turn, the note and the turns kept to it: ours for a
+		// fallback, and Pi's after a request overflowed (one after a fallback's cut that still won't fit, say);
+		// and any cut to what leaves the request under [main] at, so the next turn isn't cut again
+		const window = c.model?.contextWindow;
+		const fit = forced ?? (event.reason === "overflow" && window ? Math.floor(window * FIT_KEEP) : undefined);
+		const under = m.context === "truncate" ? atBudget(event.branchEntries, m, event.preparation.tokensBefore) : undefined;
+		const budget = fit === undefined ? under : under === undefined ? fit : Math.min(fit, under);
+		const compaction = truncation(event.branchEntries, m, { tokensBefore: event.preparation.tokensBefore, workers: await mineWorkers(), budget });
 		if (compaction) return { compaction };
 		// nothing to cut: ours stops; Pi's own goes on with its summary
 		return ours ? { cancel: true } : undefined;
 	});
 
-	pi.on("session_compact", () => compactionOver());
+	pi.on("session_compact", (event) => {
+		if (!process.env.ROUTR_ID && (event.compactionEntry?.details as { by?: unknown } | undefined)?.by === "routr") cutCheck = true;
+		compactionOver();
+	});
+
+	// The first answer after a cut: is the context still close to [main] at?
+	// The note, the first turn and the turns kept are more than at leaves room
+	// for, and each turn would be cut again.
+	pi.on("message_end", async (event) => {
+		const msg = event.message;
+		if (!cutCheck || msg.role !== "assistant" || msg.stopReason === "error" || msg.stopReason === "aborted") return;
+		cutCheck = false;
+		const prompt = msg.usage.input + msg.usage.cacheRead + msg.usage.cacheWrite;
+		const at = (await main).at;
+		// a cut that left the request over at is not tried again until it has grown a tenth: each would lose the cache for little
+		if (at !== -1) refusedAt = prompt >= at ? prompt : 0;
+		if (toldStillBig || at === -1 || prompt <= at * STILL_BIG) return;
+		toldStillBig = true;
+		ui((u) => u.ui.notify(`routr: the context after the cut is still ${prompt} tokens, close to [main] at (${at}); raise at, or lower keep_tokens (a lower head_tokens counts from a new session)`, "warning"));
+	});
 	pi.on("session_compact_failed", () => compactionOver());
 
 	// A `routr wait` (or `--wait`) the model is running will hand it these
@@ -907,7 +1038,7 @@ export default function routr(pi: ExtensionAPI): void {
 				cmd === "list"
 					? ["list", ...rest]
 					: cmd === "answer"
-						? answerArgs(Number(rest[0]), Number(rest[1]), coord.workers.find((w) => w.id === Number(rest[0]))?.fingerprint)
+						? answerArgs(Number(rest[0]), Number(rest[1]), coord.workers.find((w) => w.id === Number(rest[0]) && !w.registry)?.fingerprint)
 						: [cmd, rest[0]!];
 			const r = await runRoutr(argv, c.cwd);
 			if (r.missing) {

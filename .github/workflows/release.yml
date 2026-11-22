@@ -1,0 +1,67 @@
+# Runs on GitHub and on Gitea Actions, which reads .github/workflows too.
+# Only a v* tag pushed to GitHub publishes a release; every other run builds a
+# goreleaser snapshot and keeps the archives as a run artifact.
+name: release
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    if: github.server_url != 'https://github.com' || !startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: goreleaser/goreleaser-action@v7.3.0
+        with:
+          distribution: goreleaser
+          version: v2.18.3
+          args: release --snapshot --clean
+      - if: github.server_url == 'https://github.com'
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: routr-snapshot
+          path: |
+            dist/*.tar.gz
+            dist/checksums.txt
+          if-no-files-found: error
+      # actions/upload-artifact v4 and later abort on any server that is not
+      # github.com (they take it for GitHub Enterprise Server), and v3 is
+      # refused on github.com. Gitea (1.22+) implements the v4 artifact
+      # protocol, so on Gitea use the v4 fork that only drops that check.
+      - if: github.server_url != 'https://github.com'
+        uses: christopherHX/gitea-upload-artifact@81f940d004763f986ba3582c007fd842dd5cb0d7 # v4
+        with:
+          name: routr-snapshot
+          path: |
+            dist/*.tar.gz
+            dist/checksums.txt
+          if-no-files-found: error
+
+  publish:
+    if: github.server_url == 'https://github.com' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: goreleaser/goreleaser-action@v7.3.0
+        with:
+          distribution: goreleaser
+          version: v2.18.3
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

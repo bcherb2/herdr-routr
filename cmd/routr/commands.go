@@ -233,7 +233,7 @@ func (a *app) send(args []string) error {
 	if w.Live == nil {
 		how = "after resuming its session in a new tab"
 	}
-	fmt.Fprintf(a.stderr, "routr: queued follow-up %d for %s; it goes %s\n", turn, w.Label(), how)
+	fmt.Fprintf(a.stderr, "routr: queued follow-up %d for %s; it goes %s%s\n", turn, w.Label(), how, registryNote(p))
 	if !*wait {
 		if c.json {
 			return a.printJSON(a.view(p, w))
@@ -616,6 +616,10 @@ func (a *app) approve(args []string) error {
 			case w.State == registry.NeedsYou && !w.Finished.IsZero():
 				w.State, w.Note = registry.Done, "approved by you as it is"
 				did, approved = append(did, fmt.Sprintf("%s accepted as done", w.Label())), append(approved, id)
+			case w.Halts() && !comesAfter(m, id):
+				// A worker started on its own (a review): its fail halted nothing.
+				w.GoOn, w.Note = true, "approved by you: nothing came after it"
+				did, approved = append(did, fmt.Sprintf("%s: nothing comes after it, so nothing waited on its fail", w.Label())), append(approved, id)
 			case w.Halts():
 				// Its fail stays on record; the steps after it may start.
 				w.GoOn, w.Note = true, "approved by you: the chain goes on past its fail"
@@ -629,6 +633,13 @@ func (a *app) approve(args []string) error {
 				}
 				did, approved = append(did, fmt.Sprintf("%s: gate open", w.Label())), append(approved, id)
 			}
+		}
+		if w := m[t.id]; len(did) == 0 && t.chain == "" && w != nil && w.Succeeded() && w.Verdict != registry.Fail {
+			done := "is done; a finished worker"
+			if w.Verdict != "" {
+				done = "is done, verdict " + string(w.Verdict) + "; a pass"
+			}
+			return fmt.Errorf("nothing to approve in %s: %s %s needs no routr approve, and what comes after it starts on its own", t, w.Label(), done)
 		}
 		if len(did) == 0 {
 			return fmt.Errorf("nothing to approve in %s: no closed gate, no loop at its cap, no step that failed with no on_fail, no foreach that found the wrong files and no judge that needs you (routr list)", t)
@@ -647,6 +658,16 @@ func (a *app) approve(args []string) error {
 		return err
 	}
 	return a.acted(c, p, "approve", []string{strings.Join(did, "; ")}, ws...)
+}
+
+// comesAfter reports whether any worker in m waits on worker id.
+func comesAfter(m map[int]*registry.Worker, id int) bool {
+	for _, w := range m {
+		if slices.Contains(w.After, id) {
+			return true
+		}
+	}
+	return false
 }
 
 // retry queues failed workers again in their place: the same id, chain,
@@ -1195,8 +1216,11 @@ func (a *app) mainAgent(args []string) error {
 	fmt.Fprintf(tw, "context\t%s\n", m.Context)
 	fmt.Fprintf(tw, "at\t%s\n", limit(m.At, "tokens"))
 	fmt.Fprintf(tw, "keep_turns\t%s\n", limit(m.KeepTurns, ""))
+	onOff := map[bool]string{true: "on", false: "off"}
 	fmt.Fprintf(tw, "keep_tokens\t%s\n", limit(m.KeepTokens, "tokens"))
-	fmt.Fprintf(tw, "strip_reasoning\t%s\n", map[bool]string{true: "on", false: "off"}[m.StripReasoning])
+	fmt.Fprintf(tw, "keep_head\t%s\n", onOff[m.KeepHead])
+	fmt.Fprintf(tw, "head_tokens\t%s\n", limit(m.HeadTokens, "tokens"))
+	fmt.Fprintf(tw, "strip_reasoning\t%s\n", onOff[m.StripReasoning])
 	return tw.Flush()
 }
 
@@ -1295,13 +1319,21 @@ func mainSummary(m config.MainAgent) string {
 		s += ", by Pi's summary, which keeps what its compaction.keepRecentTokens says"
 	}
 	if m.Context == "truncate" {
+		s += ", keeping "
+		switch {
+		case !m.KeepHead:
+		case m.HeadTokens == config.Unlimited:
+			s += "the first turn and "
+		default:
+			s += fmt.Sprintf("the first turn up to %d tokens and ", m.HeadTokens)
+		}
 		switch {
 		case m.KeepTurns == config.Unlimited:
-			s += fmt.Sprintf(", keeping up to %d tokens of the latest turns", m.KeepTokens)
+			s += fmt.Sprintf("up to %d tokens of the latest turns", m.KeepTokens)
 		case m.KeepTokens == config.Unlimited:
-			s += fmt.Sprintf(", keeping the last %d turns", m.KeepTurns)
+			s += fmt.Sprintf("the last %d turns", m.KeepTurns)
 		default:
-			s += fmt.Sprintf(", keeping the last %d turns up to %d tokens", m.KeepTurns, m.KeepTokens)
+			s += fmt.Sprintf("the last %d turns up to %d tokens", m.KeepTurns, m.KeepTokens)
 		}
 	}
 	if m.StripReasoning {

@@ -106,7 +106,7 @@ func (a *app) start(args []string) error {
 		return err
 	}
 	a.ensureWatcher(p)
-	fmt.Fprintf(a.stderr, "routr: queued worker %s (%s)%s\n", w.Label(), w.Tag(), chainNote(w))
+	fmt.Fprintf(a.stderr, "routr: queued worker %s (%s)%s%s\n", w.Label(), w.Tag(), chainNote(w), registryNote(p))
 	if f.wait {
 		return a.waitFor(p, target{id: w.ID}, f.timeout, c.json)
 	}
@@ -115,6 +115,13 @@ func (a *app) start(args []string) error {
 	}
 	fmt.Fprintln(a.stdout, w.ID)
 	return nil
+}
+
+// registryNote ends a "queued" line with the registry the worker is in. A
+// front end reads it to poll that registry: the model may queue a worker
+// from another repo (cd ../other && routr start …) than its session's.
+func registryNote(p registry.Paths) string {
+	return "; registry " + p.Dir
 }
 
 func chainNote(w registry.Worker) string {

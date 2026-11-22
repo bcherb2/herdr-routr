@@ -106,7 +106,10 @@ Rules that make this safe:
   `runs/ID/done.json`, because a sandboxed worker can write only inside the
   repo. The front ends never read the registry: Pi's extension watches it for
   changes and then calls `routr list --json`; the Claude Code plugin polls
-  `routr list --json` every 2 s.
+  `routr list --json` every 2 s. Both also poll another repo's registry
+  while it holds workers the model queued there (`cd ../other && routr
+  start …`; the "queued" line names the registry), and tell a worker by its
+  registry and id, as ids are per registry.
 - **The watcher drives worker tabs:** it opens them, prompts, polls and
   reads them. The CLI talks to herdr only to act on a tab you asked about:
   `show` / `hide` move its pane, `answer` presses keys in it, and `close`,
@@ -295,7 +298,9 @@ Steps 3 and 4 are where workers change state; section 5 draws the states.
      (you're talking to it). Otherwise → `maybe_done`, and if the declared
      output file exists and changed since the start → `done`.
      `maybe_done` returns from `wait` with the last reply and a note that
-     the worker didn't run `routr done`. A last reply the watcher can't
+     the worker didn't run `routr done`, or says the reply was empty. A
+     worker still blocked as it went idle had its question dismissed or
+     refused in its tab: `unanswered` names it. A last reply the watcher can't
      read yet (its transcript not written or found) holds the worker as
      it is, rather than settle `maybe_done` or a follow-up with an empty
      reply; after a minute it settles with "routr could not read this
@@ -607,7 +612,7 @@ don't decide it again where you need it.
 
 Each topic has one doc that owns it; the others link to it. The test for
 where a fact goes: if an agent using routr might need it, it ships with
-the skill (`skills/routr/`: `install.sh` links it into Codex, and the Claude
+the skill (`skills/routr/`: `routr setup` prints the link for Codex, and the Claude
 Code plugin and the Pi extension ship it), since an agent in another repo can
 read only that and the CLI.
 

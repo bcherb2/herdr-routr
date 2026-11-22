@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { answering, asks, cardLines, engine, formatDuration, jevDecides, oneRow, parseContext, parseList, parseTime, statusText, toCards, waitsForUser, type Paint } from "../model.ts";
+import { answering, asks, cardLines, engine, formatDuration, jevDecides, oneRow, parseContext, parseList, parseTime, repoName, routrIn, statusText, toCards, waitsForUser, type Paint } from "../model.ts";
 
 const T0 = Date.parse("2026-09-26T10:00:00Z");
 const iso = (ms: number): string => new Date(T0 + ms).toISOString();
@@ -130,7 +130,7 @@ test("formatDuration", () => {
 test("cards: people first, finished ones linger, closed ones go", () => {
 	const ws = parseList(listJson);
 	const now = T0 + 254_000;
-	const activity = new Map([[3, ["a", "b", "c", "exec  rg -n auth"]]]);
+	const activity = new Map([["3", ["a", "b", "c", "exec  rg -n auth"]]]);
 	const cards = toCards(ws, { now, lingerMs: 300_000, mine: (w) => w.id === 3, answerHint: "alt+q answer", activity });
 	assert.deepEqual(cards.map((c) => c.id), [4, 5, 3, 10, 6]); // 7 finished an hour ago, 8 closed
 	const [c4, c5, c3, c10, c6] = cards;
@@ -213,4 +213,23 @@ test("a run step's engine is sh, a judge's jev", () => {
 	assert.equal(engine(run!), "sh", "no harness: not ?");
 	assert.equal(engine(judge!), "jev");
 	assert.equal(engine(worker!), "claude·opus");
+});
+
+test("another repo's worker: tagged with its repo, answered in its tab, approved there", () => {
+	const reg = "/code/vp9enc-rs/.routr";
+	const ws = [
+		{ id: 4, role: "task", harness: "claude", state: "blocked" as const, question: "ok?", registry: reg },
+		{ id: 4, role: "task", harness: "claude", state: "running" as const },
+		{ id: 5, role: "plan", harness: "claude", state: "gated" as const, registry: reg },
+	];
+	const activity = new Map([[`${reg}#4`, ["Read a.go"]], ["4", ["Edit b.go"]]]);
+	const cards = toCards(ws, { now: T0, lingerMs: 1000, mine: () => true, answerHint: "alt+q answer", activity });
+	assert.deepEqual(cards.map((c) => c.title), ["4 task @vp9enc-rs", "5 plan @vp9enc-rs", "4 task"]);
+	assert.equal(cards[0]!.note, "⚠ claude 4 asks: ok? · answer in its tab", "the picker answers at home only");
+	assert.deepEqual(cards[0]!.activity, ["Read a.go"]);
+	assert.deepEqual(cards[2]!.activity, ["Edit b.go"]);
+	assert.equal(cards[1]!.note, "waits at a gate → routr approve 5 in vp9enc-rs starts it");
+	assert.equal(routrIn({ registry: reg }), "cd /code/vp9enc-rs && ");
+	assert.equal(routrIn({}), "");
+	assert.equal(repoName("/s/state"), "state");
 });

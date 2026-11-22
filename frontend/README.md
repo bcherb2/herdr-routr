@@ -25,6 +25,12 @@ workers, and the plugin does the rest:
     model's Bash calls), or when the model's Bash output claims it. Claims are
     kept in the plugin's store per session id, so a reload of the plugin
     keeps them.
+  - A worker the model queued in another repo's registry (`cd ../other &&
+    routr start …`) is claimed there and wakes the model as in Pi
+    ([pi/README.md](../pi/README.md), "How it knows which workers are
+    mine"). Claude Code's Bash keeps its working directory between calls,
+    which the plugin can't see: a later `routr wait 7` with no `cd`, `--root`
+    or "queued" line in it counts in the session's own registry.
   - After `/clear` the session id changes. The plugin starts over as Pi does
     on `/new`: it wakes only for workers the new conversation starts.
   - A foreground `routr wait` covers its workers while it runs. A background
@@ -59,7 +65,7 @@ workers, and the plugin does the rest:
 ## Install
 
 It needs a Claude Code with mods, an early-access API that changes between
-releases (tested on 2.1.299), and `routr` on `PATH` (or `ROUTR_BIN`). The repo's `install.sh` registers it:
+releases (tested on 2.1.299), and `routr` on `PATH` (or `ROUTR_BIN`). `routr setup` (which the repo's `install.sh` runs) prints these commands, with the path filled in; it does not run them:
 
 ```sh
 claude plugin marketplace add /path/to/herdr-routr   # the repo is a marketplace (.claude-plugin/marketplace.json)
@@ -70,8 +76,7 @@ A plugin from a folder marketplace is read in place, from `frontend/`, so
 `git pull` updates it; a running session picks the change up with
 `/reload-plugins`. The skill is a link, `frontend/skills/routr` →
 `skills/routr`, which Claude Code follows. A skill of your own at
-`~/.claude/skills/routr` duplicates it: `install.sh` removes the link it made
-there itself, and warns about anything else. You don't need the `/routr`
+`~/.claude/skills/routr` duplicates it: remove it. You don't need the `/routr`
 prompt template either.
 
 To try it for one session without installing: `claude --plugin-dir

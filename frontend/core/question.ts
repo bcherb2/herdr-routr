@@ -40,9 +40,13 @@ export function questionKey(w: Worker | undefined): string | undefined {
 	return w && waitsForUser(w) ? keyOf(w.fingerprint, w.question) : undefined;
 }
 
-/** Workers whose question the user may answer, the oldest question first. */
+/**
+ * Workers whose question the user may answer here, the oldest question
+ * first. Not another repo's: the picker's `routr answer` runs in the
+ * session's own registry, so that one is answered in its tab or by the model.
+ */
 export function waiting(workers: readonly Worker[]): Worker[] {
-	return workers.filter(waitsForUser).sort((a, b) => (a.updated ?? 0) - (b.updated ?? 0) || a.id - b.id);
+	return workers.filter((w) => waitsForUser(w) && !w.registry).sort((a, b) => (a.updated ?? 0) - (b.updated ?? 0) || a.id - b.id);
 }
 
 /** Does each question a dialog shows (worker id → questionKey) still stand in this `routr list`? */
@@ -92,7 +96,7 @@ export interface Notice {
  * end opens the picker (Pi: alt+q).
  */
 export function answered(id: number, code: number, output: string, opener: string): Notice {
-	const line = output.trim().split("\n")[0] ?? "";
+	const line = (output.trim().split("\n")[0] ?? "").replace(/^routr: /, ""); // the CLI's own prefix; the notice adds one
 	if (code === 0) return { text: `routr: ${line || `answered ${id}`}`, level: "info" };
 	if (code === 4) return { text: `routr: ${id} asks another question now, so nothing was pressed. ${opener} shows it.`, level: "warning" };
 	return { text: `routr answer ${id}: ${line || `exit ${code}`}`, level: "error" };

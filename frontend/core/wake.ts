@@ -10,7 +10,7 @@
 // the hold cap (`ROUTR_WAKE_HOLD`): a long chain still reports each step's
 // result within a couple of minutes of it, not when the whole chain stops.
 
-import { ACTIVE, engine, jevDecides, type QuestionContext, type State, type Worker } from "./model.ts";
+import { ACTIVE, engine, jevDecides, refKey, repoTag, routrIn, workerKey, type QuestionContext, type State, type Worker } from "./model.ts";
 import { clip } from "./transcript.ts";
 
 export type WakeKind = "done" | "maybe_done" | "blocked" | "needs_you" | "gated" | "failed" | "closed" | "reply";
@@ -88,6 +88,18 @@ export interface WakeContext {
 	 * ends; if the call returned it, `markSeen` drops it.
 	 */
 	covered?: (w: Worker) => boolean;
+	/**
+	 * Did the session claim the worker after it began? The first list of a
+	 * registry is a baseline, but not for these: the first list of another
+	 * repo's registry comes after the model queued a worker there.
+	 */
+	fresh?: (w: Worker) => boolean;
+}
+
+/** Which registry a key (workerKey) is in: "" for the session's own. */
+function keyRegistry(key: string): string {
+	const i = key.lastIndexOf("#");
+	return i < 0 ? "" : key.slice(0, i);
 }
 
 /**
@@ -104,14 +116,22 @@ export interface WakeTrackerOptions {
 	maxHoldMs?: number;
 }
 
+/** Which list `update` is fed: the registry (undefined: the session's own), and every worker the front end lists now, of all registries. */
+export interface UpdateScope {
+	registry?: string;
+	all?: readonly Worker[];
+}
+
+// Keyed by workerKey: a worker id is only unique in its registry.
 export class WakeTracker {
 	/** every worker seen, as last seen: its previous state, and upstreams that dropped out of `list` */
-	private known = new Map<number, Worker>();
-	private notified = new Map<number, string>();
-	private held = new Map<number, Held>();
-	private suppress = new Map<number, number>(); // id → updates left
-	private failures = new Map<number, { key: string; tries: number }>(); // id → failed deliveries of its news (wakeKey)
-	private baselined = false;
+	private known = new Map<string, Worker>();
+	private notified = new Map<string, string>();
+	private held = new Map<string, Held>();
+	private suppress = new Map<string, number>(); // key → updates of its registry left
+	private failures = new Map<string, { key: string; tries: number }>(); // key → failed deliveries of its news (wakeKey)
+	/** registries whose first list was the baseline ("" for the session's own) */
+	private baselined = new Set<string>();
 	private readonly now: () => number;
 	private readonly maxHoldMs: number;
 
@@ -121,60 +141,66 @@ export class WakeTracker {
 	}
 
 	private hold(item: WakeItem): void {
-		this.held.set(item.worker.id, { worker: item.worker, kind: item.kind, heldAt: this.now() });
+		this.held.set(workerKey(item.worker), { worker: item.worker, kind: item.kind, heldAt: this.now() });
 	}
 
 	/**
 	 * The model already has these workers' results (it ran `routr wait` or
 	 * `routr result`); don't wake it for their current news, whether it is
-	 * held already or still to come.
+	 * held already or still to come. Keys are workerKey's.
 	 */
-	markSeen(ids: readonly number[]): void {
-		for (const id of ids) {
-			if (this.held.delete(id)) continue;
-			this.suppress.set(id, 3);
+	markSeen(keys: readonly string[]): void {
+		for (const k of keys) {
+			if (this.held.delete(k)) continue;
+			this.suppress.set(k, 3);
 		}
 	}
 
 	/**
-	 * Feed one fresh `routr list` snapshot; returns the news to deliver now.
-	 * The first snapshot only sets the baseline: what had already happened
-	 * before this session was looking is shown on the cards, not woken for.
+	 * Feed one fresh `routr list` snapshot of one registry (scope; the
+	 * session's own by default); returns the news to deliver now. A
+	 * registry's first snapshot only sets its baseline: what had already
+	 * happened before this session was looking is shown on the cards, not
+	 * woken for.
 	 */
-	update(workers: readonly Worker[], ctx: WakeContext): WakeItem[] {
+	update(workers: readonly Worker[], ctx: WakeContext, scope: UpdateScope = {}): WakeItem[] {
+		const reg = scope.registry ?? "";
+		const first = !this.baselined.has(reg);
 		for (const w of workers) {
-			const prev = this.known.get(w.id)?.state;
-			this.known.set(w.id, w);
+			const id = workerKey(w);
+			const prev = this.known.get(id)?.state;
+			this.known.set(id, w);
 			const kind = wakeKind(w, prev);
 			if (w.state === "cancelled") {
 				// cancelled: what it had to say before is moot
-				this.held.delete(w.id);
-				this.failures.delete(w.id);
+				this.held.delete(id);
+				this.failures.delete(id);
 			}
 			if (ACTIVE.has(w.state) && !kind) {
 				// back at work (a follow-up, or an on_fail round): old news is stale
-				this.notified.delete(w.id);
-				this.held.delete(w.id);
-				this.failures.delete(w.id);
+				this.notified.delete(id);
+				this.held.delete(id);
+				this.failures.delete(id);
 				continue;
 			}
 			if (!kind) continue;
 			const key = wakeKey(w);
-			if (this.notified.get(w.id) === key) continue;
-			if (!this.baselined || this.suppress.has(w.id)) {
-				this.notified.set(w.id, key);
-				this.suppress.delete(w.id);
+			if (this.notified.get(id) === key) continue;
+			if ((first && !ctx.fresh?.(w)) || this.suppress.has(id)) {
+				this.notified.set(id, key);
+				this.suppress.delete(id);
 				continue;
 			}
-			this.notified.set(w.id, key); // also for others' workers: turning on "wake all" later mustn't replay old news
+			this.notified.set(id, key); // also for others' workers: turning on "wake all" later mustn't replay old news
 			if (ctx.isMine(w)) this.hold({ worker: w, kind });
 		}
-		this.baselined = true;
+		this.baselined.add(reg);
 		for (const [id, left] of this.suppress) {
+			if (keyRegistry(id) !== reg) continue;
 			if (left <= 1) this.suppress.delete(id);
 			else this.suppress.set(id, left - 1);
 		}
-		return this.release(workers, ctx);
+		return this.release(scope.all ?? workers, ctx);
 	}
 
 	/**
@@ -188,7 +214,7 @@ export class WakeTracker {
 		const held: WakeItem[] = [];
 		const dropped: WakeItem[] = [];
 		for (const item of items) {
-			const id = item.worker.id;
+			const id = workerKey(item.worker);
 			const key = wakeKey(item.worker);
 			const now = this.known.get(id);
 			if (this.held.has(id) || this.suppress.has(id) || this.notified.get(id) !== key || (now && ACTIVE.has(now.state) && item.kind !== "reply")) continue;
@@ -212,12 +238,13 @@ export class WakeTracker {
 	}
 
 	/**
-	 * The model cancelled these workers (`routr cancel`): drop their held
-	 * news, and don't wake for it once the next snapshot shows them. A
-	 * finished result stays: cancel leaves a done worker done.
+	 * The model cancelled these workers (`routr cancel`; keys are
+	 * workerKey's): drop their held news, and don't wake for it once the next
+	 * snapshot shows them. A finished result stays: cancel leaves a done
+	 * worker done.
 	 */
-	drop(ids: readonly number[]): void {
-		for (const id of ids) {
+	drop(keys: readonly string[]): void {
+		for (const id of keys) {
 			if (this.held.get(id)?.kind === "done") continue;
 			this.held.delete(id);
 			this.failures.delete(id);
@@ -232,11 +259,11 @@ export class WakeTracker {
 	 * waits on a person, or is a run or judge step that failed (it halts
 	 * what comes after it). An upstream never seen is assumed to be fine.
 	 */
-	private stuck(w: Worker, visiting = new Set<number>()): boolean {
-		if (!QUEUED.has(w.state) || visiting.has(w.id)) return false;
-		visiting.add(w.id);
+	private stuck(w: Worker, visiting = new Set<string>()): boolean {
+		if (!QUEUED.has(w.state) || visiting.has(workerKey(w))) return false;
+		visiting.add(workerKey(w));
 		for (const id of w.after ?? []) {
-			const up = this.known.get(id);
+			const up = this.known.get(refKey(w.registry, id));
 			if (!up) continue;
 			if ((STOPPED.has(up.state) && !jevDecides(up)) || up.halts) return true;
 			// closed with no finish recorded: its tab went away before it was done
@@ -251,7 +278,7 @@ export class WakeTracker {
 		const now = this.now();
 		const groups = new Map<string, Held[]>();
 		for (const item of this.held.values()) {
-			const g = ctx.group(item.worker) ?? `alone:${item.worker.id}`;
+			const g = ctx.group(item.worker) ?? `alone:${workerKey(item.worker)}`;
 			groups.set(g, [...(groups.get(g) ?? []), item]);
 		}
 		const out: WakeItem[] = [];
@@ -263,11 +290,11 @@ export class WakeTracker {
 			const overdue = items.some((i) => !covered(i.worker) && now - i.heldAt >= this.maxHoldMs);
 			const busy =
 				items.some((i) => covered(i.worker)) ||
-				workers.some((w) => (ACTIVE.has(w.state) || jevDecides(w)) && !this.held.has(w.id) && ctx.isMine(w) && ctx.group(w) === g && !this.stuck(w));
+				workers.some((w) => (ACTIVE.has(w.state) || jevDecides(w)) && !this.held.has(workerKey(w)) && ctx.isMine(w) && ctx.group(w) === g && !this.stuck(w));
 			if (!urgent && !overdue && busy) continue;
 			for (const i of items) {
 				if (covered(i.worker)) continue;
-				this.held.delete(i.worker.id);
+				this.held.delete(workerKey(i.worker));
 				out.push(unheld(i));
 			}
 		}
@@ -298,7 +325,12 @@ export interface WakeMessage {
 function describe(w: Worker): string {
 	const chain = w.chain ? ` (chain ${[w.chain, w.step].filter(Boolean).join("/")})` : "";
 	const title = w.title ? ` "${w.title}"` : "";
-	return `worker ${w.id}${title} · ${w.role} · ${engine(w)}${chain}`;
+	return `worker ${w.id}${title} · ${w.role} · ${engine(w)}${chain}${repoTag(w)}`;
+}
+
+/** A routr command about w, run where its registry is: `routr result 7`, or `cd /other && routr result 7` for another repo's worker. */
+function cmd(w: Worker, args: string): string {
+	return `${routrIn(w)}routr ${args}`;
 }
 
 /**
@@ -310,85 +342,103 @@ function describe(w: Worker): string {
  */
 function whoAnswers(w: Worker, ctx?: QuestionContext): string[] {
 	if (!ctx?.answer.length) {
-		return [`Run \`routr wait ${w.id}\` before you do anything about it: it returns at once and says who answers this question, and how. Until then, choose no option.`];
+		return [`Run \`${cmd(w, `wait ${w.id}`)}\` before you do anything about it: it returns at once and says who answers this question, and how. Until then, choose no option.`];
 	}
-	return ctx.fingerprint ? [...ctx.answer, `The user can also type \`/routr answer ${w.id} N\` here.`] : ctx.answer;
+	// /routr answers in the session's own registry only
+	return ctx.fingerprint && !w.registry ? [...ctx.answer, `The user can also type \`/routr answer ${w.id} N\` here.`] : ctx.answer;
 }
 
-function clipBlock(text: string, max: number, id: number): string {
+/**
+ * Does a maybe_done worker's `routr result` hold a reply? Not when, past
+ * the "maybe done: …" line routr heads it with, there is nothing but its
+ * output, verdict and worktree lines (its final message was empty).
+ */
+function replied(result: string): boolean {
+	const body = result.startsWith("maybe done:") ? result.slice(result.indexOf("\n") + 1) : result;
+	return body.split("\n").some((l) => l.trim() !== "" && !/^(output|verdict|worktree): /.test(l));
+}
+
+function clipBlock(text: string, max: number, w: Worker): string {
 	const t = text.trim();
 	if (t.length <= max) return t;
-	return `${t.slice(0, max).trimEnd()}\n… (clipped; full text: routr result ${id})`;
+	return `${t.slice(0, max).trimEnd()}\n… (clipped; full text: ${cmd(w, `result ${w.id}`)})`;
 }
 
 /**
  * The message that wakes the model. `results` holds `routr result ID`
  * stdout for the workers that have one, and `contexts` what a question the
- * model answers is decided with (`routr show ID --context --json`). Every
- * result is clipped so the total stays near `budget` characters.
+ * model answers is decided with (`routr show ID --context --json`), both by
+ * workerKey. Every result is clipped so the total stays near `budget`
+ * characters. Another repo's worker gets its commands with the `cd` to it.
  */
 export function buildWakeMessage(
 	items: readonly WakeItem[],
-	results: ReadonlyMap<number, string>,
+	results: ReadonlyMap<string, string>,
 	budget = 8000,
-	contexts: ReadonlyMap<number, QuestionContext> = new Map(),
+	contexts: ReadonlyMap<string, QuestionContext> = new Map(),
 ): WakeMessage {
 	const per = Math.max(1200, Math.floor(budget / Math.max(1, items.length)));
 	const blocks: string[] = [];
 	const entries: WakeEntry[] = [];
 	for (const { worker: w, kind } of items) {
-		const result = results.get(w.id)?.trim() ?? "";
+		const result = results.get(workerKey(w))?.trim() ?? "";
 		const lines: string[] = [];
 		switch (kind) {
 			case "done":
 				lines.push(`[routr] ${describe(w)} is done${w.verdict ? `, verdict ${w.verdict}` : ""}.`);
-				if (w.halts) {
+				// a worker started on its own has no chain (--after puts both in one): nothing waits on its fail
+				if (w.halts && !w.chain) lines.push("No step waits on it: it was started on its own. Tell the user why it failed (below); there is nothing to approve.");
+				else if (w.halts) {
 					lines.push(
-						`The steps after it wait. Tell the user why it failed (below); run \`routr approve ${w.id}\` to go on past it only if the user says so.`,
+						`The steps after it wait. Tell the user why it failed (below); run \`${cmd(w, `approve ${w.id}`)}\` to go on past it only if the user says so.`,
 					);
 				}
 				break;
-			case "maybe_done":
+			case "maybe_done": {
+				const asked = w.unanswered ? `, after a question it asked went unanswered (dismissed or refused in its tab: ${w.unanswered})` : "";
 				lines.push(
-					`[routr] ${describe(w)} went idle without running routr done.` +
-						` Its last reply is below${w.output ? `; check that ${w.output} exists before relying on it` : ""}.`,
+					`[routr] ${describe(w)} went idle without running routr done${asked}.` +
+						` Its last reply ${replied(result) ? "is below" : "was empty"}${w.output ? `; check that ${w.output} exists before relying on it` : ""}.`,
 				);
 				break;
+			}
 			case "failed":
 				lines.push(`[routr] ${describe(w)} failed${w.error ? `: ${w.error}` : ""}.`);
 				break;
 			case "closed":
 				lines.push(
 					`[routr] ${describe(w)} was closed before it ran routr done. ` +
-						`\`routr send ${w.id} "…"\` resumes its session.`,
+						`\`${cmd(w, `send ${w.id} "…"`)}\` resumes its session.`,
 				);
 				break;
 			case "reply":
-				lines.push(`[routr] ${describe(w)} replied to follow-up ${w.turn}. It is still open: \`routr send ${w.id} "…"\` goes on.`);
+				lines.push(`[routr] ${describe(w)} replied to follow-up ${w.turn}. It is still open: \`${cmd(w, `send ${w.id} "…"`)}\` goes on.`);
 				break;
 			case "blocked":
 				lines.push(`[routr] ${describe(w)} is blocked: ${w.question ?? "(see its tab)"}`);
 				if (w.asksAbout) lines.push(`It asks about ${w.asksAbout}`);
-				lines.push(...whoAnswers(w, contexts.get(w.id)));
+				lines.push(...whoAnswers(w, contexts.get(workerKey(w))));
 				break;
 			case "gated":
 				lines.push(
 					`[routr] ${describe(w)} waits at its gate.`,
-					`Summarize what came before for the user and ask whether to start it. Run \`routr approve ${w.id}\` only after the user says yes; never approve on your own.`,
+					`Summarize what came before for the user and ask whether to start it. Run \`${cmd(w, `approve ${w.id}`)}\` only after the user says yes; never approve on your own.`,
 				);
 				break;
 			case "needs_you":
 				lines.push(`[routr] ${describe(w)} needs the user: ${w.question ?? w.error ?? "its chain cannot go on alone"}.`);
 				break;
 		}
-		if (result && WANTS_RESULT.has(kind)) lines.push("", clipBlock(result, per, w.id));
+		// another repo's: its routr commands run there (routr's own lines, `answer` above, name none)
+		if (w.registry) lines.push(`It is in another repo's registry (${w.registry}): run routr commands about it as \`${cmd(w, "…")}\`.`);
+		if (result && WANTS_RESULT.has(kind)) lines.push("", clipBlock(result, per, w));
 		else if (w.output && (kind === "done" || kind === "maybe_done")) lines.push(`output: ${w.output}`);
 		blocks.push(lines.join("\n"));
 		const firstResultLine = result.split("\n").find((l) => l.trim() && !/^(output|verdict):/.test(l));
 		entries.push({
 			id: w.id,
 			kind,
-			title: `${w.id} ${w.role}`,
+			title: `${w.id} ${w.role}${repoTag(w)}`,
 			engine: engine(w),
 			verdict: w.verdict,
 			output: w.output,

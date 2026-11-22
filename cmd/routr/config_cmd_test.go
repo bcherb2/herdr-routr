@@ -74,3 +74,23 @@ func TestConfigListsItsFiles(t *testing.T) {
 		t.Errorf("config edit: exit %d: %s", code, errOut)
 	}
 }
+
+// A key this routr doesn't know, e.g. one a newer routr added to the user
+// config, blocks no command: each warns once on stderr and runs, and doctor
+// lists the keys as a warning.
+func TestUnknownConfigKeysWarnAndRun(t *testing.T) {
+	c := newCLI(t)
+	c.userTOML("[main]\nkeep_tail = true\ntail_tokens = 4000\n")
+	code, out, errOut := c.run("", "roles")
+	if code != 0 || !strings.Contains(out, "review") {
+		t.Fatalf("roles: exit %d\n%s%s", code, out, errOut)
+	}
+	if n := strings.Count(errOut, "ignoring unknown keys in "); n != 1 || !strings.Contains(errOut, "config.toml: main.keep_tail, main.tail_tokens") ||
+		!strings.Contains(errOut, "a key from a newer routr") {
+		t.Errorf("roles stderr (want one warning naming the file and keys):\n%s", errOut)
+	}
+	code, out, errOut = c.run("", "doctor")
+	if code != 0 || errOut != "" || !strings.Contains(strings.Join(strings.Fields(out), " "), "WARN config unknown keys, ignored: ") || !strings.Contains(out, "main.keep_tail, main.tail_tokens") {
+		t.Errorf("doctor: exit %d\n%s\nstderr: %s", code, out, errOut)
+	}
+}

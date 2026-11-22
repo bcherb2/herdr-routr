@@ -42,12 +42,13 @@ test("the answer goes by the user, only on the question they saw; exit 4 says it
 	assert.deepEqual(answerArgs(7, 2, "6a128b4273b95faa"), ["answer", "7", "2", "--by", "human", "--expect", "6a128b4273b95faa"]);
 	assert.deepEqual(answerArgs(7, 2), ["answer", "7", "2", "--by", "human"], "no fingerprint seen: as in its tab");
 	assert.deepEqual(answered(7, 0, "answered 7 plan · claude with option 1 (Yes), by human\n", "alt+q"), { text: "routr: answered 7 plan · claude with option 1 (Yes), by human", level: "info" });
+	assert.deepEqual(answered(7, 0, "routr: answered 7 plan · claude with option 1 (Yes), by human\n", "alt+q"), { text: "routr: answered 7 plan · claude with option 1 (Yes), by human", level: "info" }, "the CLI's routr: is not doubled");
 	assert.deepEqual(answered(7, 4, "routr answer: 7 plan · claude asks another question now, so no option was chosen. …\nCreate a.go?", "alt+q"), {
 		text: "routr: 7 asks another question now, so nothing was pressed. alt+q shows it.",
 		level: "warning",
 	});
 	assert.deepEqual(answered(7, 1, "routr: worker 7 shows no menu now: its question was answered or went away.\n", "alt+q"), {
-		text: "routr answer 7: routr: worker 7 shows no menu now: its question was answered or went away.",
+		text: "routr answer 7: worker 7 shows no menu now: its question was answered or went away.",
 		level: "error",
 	});
 });

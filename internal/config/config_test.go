@@ -117,7 +117,6 @@ max = 50
 func TestLoadRejectsBadConfig(t *testing.T) {
 	dir := t.TempDir()
 	for text, want := range map[string]string{
-		"[roles.review]\nprefr = [\"codex\"]\n":    "roles.review.prefr",
 		"permissions = \"yolo\"\n":                 "permissions",
 		"[roles.x]\nprefer = [\"gemini\"]\n":       "gemini",
 		"[roles.x]\neffort = \"turbo\"\n":          "effort",
@@ -126,7 +125,6 @@ func TestLoadRejectsBadConfig(t *testing.T) {
 		"[roles.x]\ngate = \"ci\"\n":               "gate",
 		"[registry]\nkeep_days = -1\n":             "registry.keep_days",
 		"[registry]\nmax = -5\n":                   "registry.max",
-		"[registry]\nkeep = 3\n":                   "registry.keep",
 		"not toml":                                 "bad.toml",
 		"[questions]\nanswer = \"me\"\n":           `questions.answer = "me": use one of human, agent, jev`,
 		"[questions]\nanswer = \"\"\n":             `questions.answer = "": use one of human, agent, jev`,
@@ -137,12 +135,41 @@ func TestLoadRejectsBadConfig(t *testing.T) {
 		"[questions]\ncontext = [\"/etc/x\"]\n":    `questions.context: "/etc/x": use a path relative to the repo root`,
 		"[questions]\ncontext = [\"../x.md\"]\n":   `questions.context: "../x.md"`,
 		"[questions]\ncontext = \"SPEC.md\"\n":     "bad.toml",
-		"[questions]\nanswerer = \"jev\"\n":        "questions.answerer",
 	} {
 		p := write(t, dir, "bad.toml", text)
 		if _, err := Load(p); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("%q: err = %v, want mention of %s", text, err, want)
 		}
+	}
+}
+
+// An unknown key is ignored and listed per file, not an error: an older
+// routr reads the config a newer one's keys are in. Keys it knows still
+// load, and a bad value is still an error.
+func TestLoadIgnoresUnknownKeys(t *testing.T) {
+	dir := t.TempDir()
+	user := write(t, dir, "user.toml", "[main]\nat = 50000\nkeep_tail = true\ntail_tokens = 4000\n[registry]\nkeep = 3\n[shiny]\nx = 1\ny = \"z\"\n")
+	repo := write(t, dir, "repo.toml", "[roles.review]\nprefr = [\"codex\"]\n[[fallback]]\nfrom = [\"*opus*\"]\nto = [\"codex:gpt-6.1\"]\nwhen = \"always\"\n")
+	c, err := Load(user, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		user + ": main.keep_tail, main.tail_tokens, registry.keep, shiny",
+		repo + ": roles.review.prefr, fallback.when",
+	}
+	if !slices.Equal(c.Unknown, want) {
+		t.Errorf("Unknown = %q, want %q", c.Unknown, want)
+	}
+	if c.Main.At != 50000 || len(c.Fallback) != 1 || c.Roles["review"].Prefer == nil {
+		t.Errorf("known keys lost: main %+v, fallback %+v, review %+v", c.Main, c.Fallback, c.Roles["review"])
+	}
+	if c, err := Load(); err != nil || c.Unknown != nil {
+		t.Errorf("built-in only: Unknown = %q, err = %v", c.Unknown, err)
+	}
+	bad := write(t, dir, "bad.toml", "bogus = 1\npermissions = \"yolo\"\n")
+	if _, err := Load(bad); err == nil || !strings.Contains(err.Error(), "permissions") {
+		t.Errorf("a bad value beside an unknown key: err = %v", err)
 	}
 }
 

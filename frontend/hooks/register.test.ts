@@ -21,6 +21,8 @@ function host(on: On) {
 	const world = {
 		session: S1,
 		workers: [] as W[],
+		/** other repos' registries (.routr directory → its workers), listed with ROUTR_STATE_DIR set */
+		elsewhere: new Map<string, W[]>(),
 		results: new Map<number, string>(),
 		calls: [] as string[],
 		submitted: [] as string[],
@@ -38,12 +40,18 @@ function host(on: On) {
 		bash: (_e: any): unknown => ({ result: { stdout: "", stderr: "", interrupted: false }, text: "" }),
 	};
 	on("session.id", () => ({ value: world.session }));
-	on("process.run", ($, e) => ({ value: routr(e.argv) }));
-	const routr = (argv: readonly string[]) => {
+	on("process.run", ($, e) => ({ value: routr(e.argv, e.init?.env?.ROUTR_STATE_DIR) }));
+	const routr = (argv: readonly string[], registry?: string) => {
 		const [bin, ...args] = argv;
 		if (bin === "git") return { exitCode: 128, stdout: "", stderr: "not a git repository", isStdoutTruncated: false, isStderrTruncated: false };
 		const ok = (stdout: string) => ({ exitCode: 0, stdout, stderr: "", isStdoutTruncated: false, isStderrTruncated: false });
 		if (bin === "tail") return ok(world.transcripts.get(args.at(-1)!) ?? "");
+		if (bin === "realpath") return ok(`${args[0]}\n`);
+		if (registry) {
+			world.calls.push(`[${registry}] ${args.join(" ")}`);
+			if (args[0] === "list") return ok(JSON.stringify(world.elsewhere.get(registry) ?? []));
+			if (args[0] === "result") return ok(`${registry}'s ${args[1]}: Done there.`);
+		}
 		world.calls.push(args.join(" "));
 		if (args[0] === "answer") {
 			const w = world.workers.find((x) => x.id === Number(args[1]));
@@ -235,6 +243,36 @@ test("a background routr wait covers its worker until its task notification", as
 	await $.session.append(notice("b6", "failed") as any); // routr wait's exit 3: it returned nothing
 	await h.clock.advance(2 * POLL);
 	expect(wakes(h.world.submitted)).toEqual([expect.stringContaining("[routr] worker 6 ")]);
+});
+
+// The model queued a worker in another repo (cd ../other && routr start …): the
+// mod lists that registry too, and wakes for it, never for the same id here.
+test("a worker queued in another repo's registry wakes the model; the same id here does not", async ($, on) => {
+	const h = host(on);
+	const other = "/code/vp9enc-rs/.routr";
+	await start($, h, [worker(7, "running", { caller: { harness: "claude", session: "other" } })]);
+	h.world.bash = () => {
+		const text = `routr: queued worker 7 review · codex (codex); registry ${other}\n7\n`;
+		h.world.elsewhere.set(other, [worker(7, "running", { role: "review", harness: "codex", caller: undefined })]);
+		return { result: { stdout: "7\n", stderr: text, interrupted: false }, text };
+	};
+	await turnStart($);
+	await $.tool.call({ tool: "Bash", command: "cd /code/vp9enc-rs && routr start --role review x", description: "start" } as any);
+	await turnEnd($);
+	await h.clock.advance(POLL);
+	expect(h.world.calls).toContain(`[${other}] list --json`);
+	h.world.workers = [worker(7, "done", { caller: { harness: "claude", session: "other" } })];
+	h.world.elsewhere.set(other, [worker(7, "done", { role: "review", harness: "codex", caller: undefined })]);
+	await h.clock.advance(POLL);
+	const w = wakes(h.world.submitted);
+	expect(w).toEqual([expect.stringContaining("[routr] worker 7 · review · codex @vp9enc-rs is done")]);
+	expect(w[0]).toContain(`${other}'s 7: Done there.`);
+	expect(w[0]).toContain("`cd /code/vp9enc-rs && routr …`");
+	await h.clock.advance(3 * POLL);
+	expect(wakes(h.world.submitted).length).toBe(1); // here, 7 is another session's
+	const lists = h.world.calls.filter((c) => c === `[${other}] list --json`).length;
+	await h.clock.advance(3 * POLL);
+	expect(h.world.calls.filter((c) => c === `[${other}] list --json`).length).toBe(lists); // done with: no longer listed
 });
 
 test("after /clear the new conversation wakes only for the workers it starts", async ($, on) => {

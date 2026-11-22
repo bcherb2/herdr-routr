@@ -115,7 +115,7 @@ func (w *Watcher) working(wk registry.Worker) {
 		if x.State == registry.NeedsYou {
 			x.Error, x.TurnError = "", ""
 		}
-		x.State, x.Note, x.Idle = registry.Running, "", time.Time{}
+		x.State, x.Note, x.Idle, x.Unanswered = registry.Running, "", time.Time{}, ""
 		x.ClearQuestion()
 	}
 	if !wk.Write {
@@ -264,11 +264,26 @@ func (w *Watcher) idle(ctx context.Context, wk registry.Worker, d worker.Driver,
 		return
 	}
 	w.writeRun(wk, w.Paths.FinalPath(wk), reply)
+	// still blocked as it went idle: its question went away with no routr answer (Esc, or No, in its tab)
+	asked := ""
+	if wk.State == registry.Blocked {
+		asked = firstLine(wk.Question)
+		if wk.Pending != nil && wk.Pending.Summary != "" {
+			asked = wk.Pending.Summary
+		}
+	}
 	w.set(wk, func(x *registry.Worker) {
-		x.State, x.Idle = registry.MaybeDone, w.now()
+		x.State, x.Idle, x.Unanswered = registry.MaybeDone, w.now(), asked
 		x.ClearQuestion()
 		x.TurnError, x.Retries, x.Retry = "", 0, time0
-		x.Note = fmt.Sprintf("idle without running routr done; routr result %d has its last reply. routr send %d … to go on, or routr close %d", wk.ID, wk.ID, wk.ID)
+		why, last := "", fmt.Sprintf("routr result %d has its last reply", wk.ID)
+		if asked != "" {
+			why = fmt.Sprintf(" after its question went unanswered (%s)", asked)
+		}
+		if strings.TrimSpace(reply) == "" {
+			last = "its last reply was empty"
+		}
+		x.Note = fmt.Sprintf("idle without running routr done%s; %s. routr send %d … to go on, or routr close %d", why, last, wk.ID, wk.ID)
 	})
 	w.Log.Printf("%s: maybe done", wk.Label())
 }

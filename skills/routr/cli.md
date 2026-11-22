@@ -132,8 +132,8 @@ or cancelled.
 
 | Command | Does |
 |---|---|
-| `routr start [flags] BRIEF\|-` | queue one worker. Prints its id alone on stdout (so pipes work) unless `--wait`. `-` reads the brief from stdin. With `--run CMD` instead of a brief, a run step (flows.md, "Run steps"). |
-| `routr wait ID\|chain\|- [--timeout 9m]` | block until the worker (or every worker of a chain) is terminal, or blocked/gated. For an ID or a chain it also stops when a worker a queued step comes after (transitively) is blocked, gated, needs you, failed or cancelled, went idle without `routr done` (`maybe_done`: exit 4, with its last reply), or is a step that failed with no `on_fail` and was not approved past (exit 4, with its final message), so `… \| routr wait -` ends when the chain can't go on. A queued or unanswered follow-up keeps it waiting, even on a failed or needs_you worker (the follow-up resumes it). Prints the final message (for a chain, each step's one-line summary and the last step's final message), or the reply to the latest follow-up if that is newer; for a blocked worker, its question and who answers it ("Who answers"); for a failed one, its error and then the next step its record calls for (never started: `routr retry ID` with its brief; no session: `routr retry ID`; a session: `routr send ID …`). It goes on waiting while Jev decides a question (`answer = jev`). On timeout: `still running: 3 review · codex (4m12s). Run: routr wait 3`, exit 3. `-` reads an id from stdin. |
+| `routr start [flags] BRIEF\|-` | queue one worker. Prints its id alone on stdout (so pipes work) unless `--wait`, and on stderr `routr: queued worker 7 review · codex (…); registry /repo/.routr`, the registry it is in (`flow start` and `send` end their "queued" lines the same way). `-` reads the brief from stdin. With `--run CMD` instead of a brief, a run step (flows.md, "Run steps"). |
+| `routr wait ID\|chain\|- [--timeout 9m]` | block until the worker (or every worker of a chain) is terminal, or blocked/gated. For an ID or a chain it also stops when a worker a queued step comes after (transitively) is blocked, gated, needs you, failed or cancelled, went idle without `routr done` (`maybe_done`: exit 4, with its last reply, or "its last reply was empty"), or is a step that failed with no `on_fail` and was not approved past (exit 4, with its final message), so `… \| routr wait -` ends when the chain can't go on. A queued or unanswered follow-up keeps it waiting, even on a failed or needs_you worker (the follow-up resumes it). Prints the final message (for a chain, each step's one-line summary and the last step's final message), or the reply to the latest follow-up if that is newer; for a blocked worker, its question and who answers it ("Who answers"); for a failed one, its error and then the next step its record calls for (never started: `routr retry ID` with its brief; no session: `routr retry ID`; a session: `routr send ID …`). It goes on waiting while Jev decides a question (`answer = jev`). On timeout: `still running: 3 review · codex (4m12s). Run: routr wait 3`, exit 3. `-` reads an id from stdin. |
 | `routr result ID [--path]` | this run's final message (or the newer follow-up reply, or `revision for 4 review (on_fail round 1):` for a review loop's revision), then `output: PATH`, `verdict: pass` and (a worktree step) `worktree: PATH (branch B)` lines. A worker whose state calls for it gets the line `routr wait` would stop with first, then a blank line: failed, with its error and next step (`routr retry ID` or `routr send ID …`); cancelled; needs you; blocked; closed; `maybe done`, with `routr send ID …` to have it go on. What it prints is always the current run's: a new run (`routr retry`; a review loop, for its `resume` worker, its reviewer and the checks it runs again) writes its own `final-<n>.md`, leaving the last run's where it was, and clears the verdict, and a reply counts only if its follow-up came in this run (`run_from`). With none, it says why in `routr wait`'s words (failed, with `routr retry ID` or `routr send ID …`; cancelled; needs you; blocked; gated), a foreach step lists its copies, a `previous run's final message: PATH` line names the run before's, and only a worker still at work says `Run: routr wait ID` (exit 1). `--path` prints only the path of the file holding the result, for `cat` or `grep`: the reply's `turns/N.md` when the reply is the result, else this run's final message. With no result it prints what `routr result` would, with the same exit code; with `--json` it is a usage error |
 | `routr send ID TEXT\|-` | queue a follow-up turn; prints the id. If the tab is gone, the watcher resumes the session in a new tab. `--wait` waits for the reply to this turn and prints it. A run or judge step has no session: refused. So is a failed worker with no session to resume (its start failed, or its harness recorded none): the refusal names `routr retry ID`, which starts it again. A follow-up whose session will not resume is dropped: the worker is `failed` with the dropped text, and watch.log says so. |
 | `routr done [--output F] [--verdict pass\|fail] [MESSAGE\|-]` | run by the worker (uses `ROUTR_ID`, or `--id`). `--output` must exist; it is stored as an absolute path. |
@@ -141,7 +141,7 @@ or cancelled.
 | `routr show ID [--focus]` / `routr hide ID` | put the worker's pane beside the caller's pane (`HERDR_PANE_ID`), `--focus` moving focus to it / back into its tab |
 | `routr show ID --context` | print what the worker's question is decided with: the question, the tool call it is about, its brief, and the project docs to read, as paths. No pane moves; it reads only the registry and files. `--json` gives the same as data. See "What a question is decided with" |
 | `routr close ID` | close the tab; the session stays resumable (`routr send` reopens it). A run or judge step has no tab: refused (`routr cancel` stops its command or call) |
-| `routr approve ID\|chain` | open a gate (for a chain: the gated workers). On a review worker at its loop cap (`needs_you`), accept its result as done so the chain goes on. On a foreach step that matched no files or too many (`needs_you`), look for its files again. On a judge step that needs you because Jev was unsure, take Jev's choice; because it had no key or failed, ask again. On any step that failed with no `on_fail`, let the steps after it go on past the fail (`go_on`; its verdict stays fail). |
+| `routr approve ID\|chain` | open a gate (for a chain: the gated workers). On a review worker at its loop cap (`needs_you`), accept its result as done so the chain goes on. On a foreach step that matched no files or too many (`needs_you`), look for its files again. On a judge step that needs you because Jev was unsure, take Jev's choice; because it had no key or failed, ask again. On any step that failed with no `on_fail`, let the steps after it go on past the fail (`go_on`; its verdict stays fail); with nothing after it (a worker started on its own) nothing waited, and approve only records that. A worker that passed has nothing to approve: it says so. |
 | `routr answer ID N [--expect FP] [--by human\|agent\|jev]` | pick option N of a blocked worker's menu, numbered as on screen. `--expect FP` presses nothing unless the question on screen is still the one with fingerprint FP. `--by` says who chose (default `human`); `agent` and `jev` need `--expect`, and may not pick an option that saves a rule or lasts past this call. The same holds whoever runs it, the user or an agent. See "Answering a question" |
 | `routr retry ID\|chain` | queue a `failed` worker (for a chain: each of its failed workers) again in its place: the same id, chain, step, round and worktree, so the workers after it wait on it as before. One that never started gets its brief afresh; one that ran keeps its session and is rerun in it (a review loop's round gets the revised prompt). What the failed run concluded becomes history: the new run writes its own final message, leaving the failed run's where it was, and its verdict and summary are cleared. A tab its failure left open is closed, and a dropped follow-up stays dropped. Any other state is refused, with what to do instead (`routr send` for a closed or `maybe_done` worker). |
 | `routr cancel ID\|chain` | stop: close tabs, kill a run step's command (its process group), mark cancelled, release the lock. Workers after a cancelled ID are not cancelled; it names them. Cancelling a foreach step's worker cancels its copies. |
@@ -152,7 +152,8 @@ or cancelled.
 | `routr config [init\|example]` | the config files routr reads (the user's, then the repo's) and whether each exists (`--json`: `{user, repo}`, each `{path, exists}`). `init` writes the user file, with every key commented out and explained, when there is none (`--json`: `{path, created}`); `example` prints that template |
 | `routr main` | the `[main]` settings with any `ROUTR_MAIN_*` override: how the main agent keeps its context small (see "[main]" under "Roles and config"). A setting it rejects, or keys that don't fit together, is an error that names them |
 | `routr fallback HARNESS:MODEL [--error MSG]` | the `[[fallback]]` rule for a model (see "[[fallback]]" under "Roles and config"): its number and the models its work moves to, in order; rule 0 and none when no rule matches. `--error MSG` adds whether MSG, the API error the model failed with, is one waiting won't fix (`lasting` in `--json`: credit, a 402, quota, a usage limit, a login), the same test the watcher uses before it retries a worker's turn. A front end asks this when its model fails |
-| `routr doctor [--socket S]` | one line per check, with the next step for each problem: the repo and its state directory, config, the `[main]` settings, the `[[fallback]]` rules (a rule an earlier one hides warns), whether this process can reach herdr (a sandbox that denies it fails only while no watcher runs), the watcher, each harness (installed and logged in; none ready fails), the registry (a set-aside corrupt one warns), whether `OPENROUTER_API_KEY` is set for judge steps (a warning), the caller, the permissions a worker gets without `--permissions`, and the build: a binary built by `install.sh` (which stamps its checkout as `main.srcDir`) warns when that checkout has commits since its revision under `cmd`, `internal`, `go.mod` or `go.sum`, since the skill, the Claude Code plugin and the Pi extension are read live from it and are then newer than the binary; a binary built with uncommitted changes warns too. Exit 1 if a check fails |
+| `routr setup [--bin-dir D] [--dry-run] [--socket S]` | puts routr's own pieces in place, one line each with the next step: links this binary as `D/routr` (default `~/.local/bin`; a symlink, repointed if it points elsewhere; a file that is not a symlink is left alone and fails), warns when D is not on `PATH` or another `routr` comes first, writes the user config as `config init` does, and restarts idle watchers still running a replaced binary (one with workers in flight is left, with the pid to stop). It checks herdr (its protocol, as doctor does, or only that `herdr` is on `PATH` outside a pane) and each harness, and for each harness found prints the command that adds its front end from the source tree (`$HERDR_PLUGIN_ROOT`, else the checkout `install.sh` built from, else the binary's directory). herdr builds each plugin update in a new directory and removes the old one, so under a herdr plugin install setup also links `${XDG_DATA_HOME:-~/.local/share}/routr/plugin` to it (a file there that is not a symlink, or a link to anything but a herdr install of routr, is left alone and fails) and names the front ends by that path; the plugin's build step repoints it, as it does the binary link. A Codex skill linked straight into a herdr install warns, with the command that relinks it. It installs and registers nothing outside routr. `--dry-run` prints the plan. Exit 1 only when a piece of routr's could not be put in place; a missing harness or herdr warns. `install.sh` builds the binary and runs it |
+| `routr doctor [--socket S]` | one line per check, with the next step for each problem: the repo and its state directory, config, the `[main]` settings, the `[[fallback]]` rules (a rule an earlier one hides warns), whether this process can reach herdr (a sandbox that denies it fails only while no watcher runs) and the socket protocol it speaks (older than routr's fails, naming the herdr release to update to; newer warns), the watcher, each harness (installed and logged in; none ready fails), the registry (a set-aside corrupt one warns), whether `OPENROUTER_API_KEY` is set for judge steps (a warning), where Pi's agent directory exists (`$PI_CODING_AGENT_DIR`, else `~/.pi/agent`) two Pi settings that make a long main-agent run re-send its conversation uncached (warnings: pi-memory installed without `"memory": {"perTurnInjection": false}`, read as pi-memory reads it from `~/.pi/agent/settings.json` and the project's `.pi/settings.json`; and `PI_CACHE_RETENTION` set to other than `long`, which turns off the hour-long cache routr's Pi extension asks for), the caller, the permissions a worker gets without `--permissions`, and the build: a binary built by `install.sh` (which stamps its checkout as `main.srcDir`) warns when that checkout has commits since its revision under `cmd`, `internal`, `go.mod` or `go.sum`, since the skill, the Claude Code plugin and the Pi extension are read live from it and are then newer than the binary; a binary built with uncommitted changes warns too. Exit 1 if a check fails |
 | `routr version` | the git revision the binary was built from (`go build` stamps it), `+dirty` if it had uncommitted changes, the commit time, the Go version, and the checkout `install.sh` built it from. `--json`: `{revision, time, modified, go, src}`; `revision` is empty for a binary built outside a git checkout |
 | `routr hook --log FILE EVENT` | Claude's hook sink: appends `{ts, event, payload}` (the payload as Claude sent it) to FILE. A Claude worker's PermissionRequest hook runs it, see "Answering a question" |
 
@@ -169,8 +170,10 @@ them. `--json` prints one JSON object or array: the registry record(s)
 `0001-01-01…`; a blocked worker's menu is `options`, `fingerprint` and
 `block_seq`, the tool call its question is about `pending`, its last
 answer `answer` and `answered_by`, who answers its questions
-`answerer`, and who Jev handed its question to `handed_to`, see
-"Answering a question" and "Who answers") plus `run_dir`, `final` (the text of this run's final message),
+`answerer`, who Jev handed its question to `handed_to`, see
+"Answering a question" and "Who answers", and on a `maybe_done` worker the
+question that went unanswered as it went idle, dismissed or refused in its
+tab, `unanswered`) plus `run_dir`, `final` (the text of this run's final message),
 `final_path` (this run's final message, once it exists; `routr result --path`
 names the reply's file when the reply is the result), `reply` (the latest follow-up reply, if it
 came in this run and is newer than the final) and
@@ -533,7 +536,7 @@ permissions. What it does each tick is in the repo's
 User config `$XDG_CONFIG_HOME/routr/config.toml` (else
 `~/.config/routr/config.toml`), merged under `<root>/.routr/config.toml`
 (repo wins per key). Both are optional: with neither, every key has its
-default. `install.sh` runs `routr config init`, which writes the user file
+default. `routr setup` (which `install.sh` runs) does `routr config init`, which writes the user file
 the first time with every key commented out and explained; it never
 touches a file that exists. Some keys, with example values:
 
@@ -559,6 +562,8 @@ context = "truncate"            # truncate, summarize or off
 at = 150000                     # compact once the context passes this many tokens after a turn; 0 = 150000, -1 = no limit
 keep_turns = 3                  # the last turns a compaction keeps as they are; 0 = 3, -1 = no limit
 keep_tokens = 40000             # at most this many tokens of them; 0 = 40000, -1 = no limit
+keep_head = true                # a truncation keeps the session's first turn as it was, in front of its note
+head_tokens = 40000             # at most this many tokens of that first turn; 0 = 40000, -1 = no limit
 strip_reasoning = true          # drop earlier turns' reasoning from each request
 
 [[fallback]]                    # when a model runs out of credit or quota (see "[[fallback]]" below)
@@ -604,7 +609,11 @@ low…max; codex `model_reasoning_effort` low, medium, high; pi `--thinking`
 off, minimal, low…max), and a level the picked harness doesn't take is an
 error. A model is passed to the harness as is: for Pi, any `provider/id`
 it has a key for (`pi --list-models`), e.g.
-`openrouter/deepseek/deepseek-v4-flash`. Unknown keys are errors.
+`openrouter/deepseek/deepseek-v4-flash`. A key routr doesn't know is
+ignored, with one warning per command on stderr naming the file and key,
+and `routr doctor` lists it: a typo, or a key from a newer routr, so an
+older binary still runs with a config a newer one wrote. A bad value for a
+known key is an error.
 
 | Harness | `--model` takes |
 |---|---|
@@ -631,19 +640,33 @@ a worker (`ROUTR_ID` set). Its front end reads it at session start with
 `routr main --json`. `strip_reasoning` drops each earlier turn's reasoning
 from the model's requests (the Pi front end, Chat Completions models
 only: a provider such as DeepSeek bills resent reasoning as input).
-`context`, `at`, `keep_turns` and `keep_tokens` compact the context on a
-long run (the Pi front end; Claude Code and Codex compact on their own).
+`context`, `at`, `keep_turns`, `keep_tokens`, `keep_head` and
+`head_tokens` compact the context on a long run (the Pi front end; Claude Code and Codex compact on their own).
 Once a run ends with the context past `at` tokens, as Pi counts them
 with the system prompt, it is compacted before the next turn (not after
 the user interrupted it), and workers' news waits until that is done. `truncate` makes no
-model call. A note takes the place of the earlier conversation. It
+model call. With `keep_head` on, the session's first turn stays as it
+was: the user's first message and all the agent read and did in it. A
+note follows, in place of the rest of the earlier conversation. It
 carries the session's first message word for word (re-read any file it
 names), what the user wrote since, the latest todo list, this session's
 routr workers, and where state lives (beads, git, routr). The last
 `keep_turns` turns follow as they were, at most `keep_tokens` of them
-(Pi's estimate, a token per 4 characters), cut where a turn starts. A
+(Pi's estimate, a token per 4 characters), cut where a turn starts.
+Since tool output and JSON often take twice that estimate, the cut is
+also held to what leaves the request, system prompt included, at 70% of
+`at` in the provider's own count, scaled by how far the last request was
+over Pi's estimate: fewer turns kept, then the first turn shrunk or
+dropped. A cut that still leaves it past `at` is not tried again until
+the context has grown a tenth. A
 latest turn over `keep_tokens` on its own keeps its last steps, and its
-first message goes in the note. `summarize` has Pi summarize instead,
+first message goes in the note. The first turn ends in a cache
+breakpoint, so a later cut re-sends only the note and the recent turns.
+A first turn over `head_tokens` is shrunk: its thinking goes first, then
+its largest tool results, each replaced by a short stub that says to
+re-read. If it is still too big, only its first message goes in the
+note, as with `keep_head = false`. `summarize` and `off` ignore both
+keys. `summarize` has Pi summarize instead,
 told to keep worker and bead IDs, branches and open decisions. Pi then
 keeps what its `compaction.keepRecentTokens` says, not `keep_turns` or
 `keep_tokens`. The compaction Pi starts itself near the model's window
@@ -654,7 +677,8 @@ nothing shorter than its `compaction.keepRecentTokens` of conversation
 cut can wait; the front end says so once. 0 or unset is the default and
 -1 no limit.
 `ROUTR_MAIN_CONTEXT`, `ROUTR_MAIN_AT`, `ROUTR_MAIN_KEEP_TURNS`,
-`ROUTR_MAIN_KEEP_TOKENS` and `ROUTR_MAIN_STRIP_REASONING` (1 or 0)
+`ROUTR_MAIN_KEEP_TOKENS`, `ROUTR_MAIN_KEEP_HEAD` (1 or 0),
+`ROUTR_MAIN_HEAD_TOKENS` and `ROUTR_MAIN_STRIP_REASONING` (1 or 0)
 override a key for one run. A value below -1 or an unknown `context` is a
 config error for every command, as in any section, and no override
 helps. Keys that don't fit together are checked only where they are read
@@ -662,7 +686,9 @@ helps. Keys that don't fit together are checked only where they are read
 overrides, so one can fix them for a run: unless `context = "off"`,
 `keep_turns` and `keep_tokens` both -1 (a cut would keep everything), or a
 `keep_tokens` not below `at` (the context would be over the limit again
-straight after each cut). A front end that can't read them uses the
+straight after each cut). A truncation that keeps the first turn needs
+`head_tokens` plus `keep_tokens` below `at`, for the same reason; a -1 in
+any of the three skips that check. A front end that can't read them uses the
 defaults with the `ROUTR_MAIN_*` overrides, and says why.
 
 **`[[fallback]]`** rules say where a model's work goes when the model

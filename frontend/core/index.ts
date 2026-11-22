@@ -17,6 +17,7 @@ export {
 	parseList,
 	statusText,
 	toCards,
+	workerKey,
 	type Card,
 	type CardOptions,
 	type Paint,
@@ -26,6 +27,7 @@ export {
 	type Worker,
 } from "./model.ts";
 export { holdFromEnv, type WakeEntry, type WakeItem, type WakeKind, type WakeMessage } from "./wake.ts";
+export { placeKey, places, type Place } from "./claims.ts";
 export { Coordinator, type ClaimsEntry, type CoordinatorOptions, type SnapshotOutcome, type TurnEnd, type Wake, type WakeMode } from "./coordinator.ts";
 export { answerArgs, answered, closed, question, questionKey, stillAsked, waiting, type Choice, type Notice, type Question } from "./question.ts";
 export { stepLines, toSteps, type StepBlock, type StepOptions, type StepRow } from "./steps.ts";

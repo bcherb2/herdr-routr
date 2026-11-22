@@ -28,17 +28,22 @@ func TestMainPrintsTheMainAgentSettings(t *testing.T) {
 	if err := json.Unmarshal([]byte(c.mustRun("", "main", "--json")), &got); err != nil {
 		t.Fatal(err)
 	}
-	if want := (config.MainAgent{Context: "truncate", At: 150_000, KeepTurns: 3, KeepTokens: 40_000, StripReasoning: true}); got != want {
+	if want := (config.MainAgent{Context: "truncate", At: 150_000, KeepTurns: 3, KeepTokens: 40_000, KeepHead: true, HeadTokens: 40_000, StripReasoning: true}); got != want {
 		t.Errorf("main --json = %+v; want %+v", got, want)
 	}
 
-	c.userTOML("[main]\ncontext = \"summarize\"\nkeep_turns = -1\n")
+	c.userTOML("[main]\ncontext = \"summarize\"\nkeep_turns = -1\nhead_tokens = -1\n")
 	c.env["ROUTR_MAIN_STRIP_REASONING"] = "0"
-	out := c.mustRun("", "main")
-	for _, want := range []string{"context          summarize\n", "at               150000 tokens\n", "keep_turns       no limit\n", "keep_tokens      40000 tokens\n", "strip_reasoning  off\n"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("main lacks %q:\n%s", want, out)
-		}
+	c.env["ROUTR_MAIN_KEEP_HEAD"] = "0"
+	want := "context          summarize\n" +
+		"at               150000 tokens\n" +
+		"keep_turns       no limit\n" +
+		"keep_tokens      40000 tokens\n" +
+		"keep_head        off\n" +
+		"head_tokens      no limit\n" +
+		"strip_reasoning  off\n"
+	if out := c.mustRun("", "main"); out != want {
+		t.Errorf("main =\n%s\nwant\n%s", out, want)
 	}
 }
 
@@ -60,11 +65,11 @@ func TestMainOutsideARepo(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(c.dir, ".routr"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(c.dir, ".routr", "config.toml"), []byte("[main]\nat = 77777\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(c.dir, ".routr", "config.toml"), []byte("[main]\nat = 97777\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	var got config.MainAgent
-	if err := json.Unmarshal([]byte(c.mustRun("", "main", "--json")), &got); err != nil || got.At != 77_777 || got.KeepTurns != 5 {
+	if err := json.Unmarshal([]byte(c.mustRun("", "main", "--json")), &got); err != nil || got.At != 97_777 || got.KeepTurns != 5 {
 		t.Errorf("main --json = %+v, %v", got, err)
 	}
 }
@@ -80,15 +85,35 @@ func TestMainKeysThatDontFitBlockNothingElse(t *testing.T) {
 		t.Errorf("main: exit %d: %s", code, errOut)
 	}
 	c.env["ROUTR_MAIN_KEEP_TOKENS"] = "10000"
+	code, _, errOut = c.run("", "main")
+	if code != exitError || !strings.Contains(errOut, "main.head_tokens + main.keep_tokens (50000) is not below main.at (30000)") {
+		t.Errorf("main: exit %d: %s", code, errOut)
+	}
+	c.env["ROUTR_MAIN_HEAD_TOKENS"] = "10000"
 	c.mustRun("", "main")
 }
 
 func TestDoctorReportsTheMainAgent(t *testing.T) {
 	c := newCLI(t)
 	squeeze := func(s string) string { return strings.Join(strings.Fields(s), " ") }
-	want := "OK main truncate at 150000 tokens, keeping the last 3 turns up to 40000 tokens; earlier turns' reasoning stripped"
+	want := "OK main truncate at 150000 tokens, keeping the first turn up to 40000 tokens and the last 3 turns up to 40000 tokens; earlier turns' reasoning stripped"
 	if out := squeeze(c.mustRun("", "doctor")); !strings.Contains(out, want) {
 		t.Errorf("doctor lacks %q:\n%s", want, out)
+	}
+	c.env["ROUTR_MAIN_KEEP_HEAD"] = "0"
+	want = "OK main truncate at 150000 tokens, keeping the last 3 turns up to 40000 tokens; earlier"
+	if out := squeeze(c.mustRun("", "doctor")); !strings.Contains(out, want) {
+		t.Errorf("doctor lacks %q:\n%s", want, out)
+	}
+	c.env["ROUTR_MAIN_KEEP_HEAD"] = "1"
+	c.env["ROUTR_MAIN_HEAD_TOKENS"] = "-1"
+	c.env["ROUTR_MAIN_KEEP_TURNS"] = "-1"
+	want = "OK main truncate at 150000 tokens, keeping the first turn and up to 40000 tokens of the latest turns; earlier"
+	if out := squeeze(c.mustRun("", "doctor")); !strings.Contains(out, want) {
+		t.Errorf("doctor lacks %q:\n%s", want, out)
+	}
+	for _, k := range []string{"ROUTR_MAIN_KEEP_HEAD", "ROUTR_MAIN_HEAD_TOKENS", "ROUTR_MAIN_KEEP_TURNS"} {
+		delete(c.env, k)
 	}
 	c.env["ROUTR_MAIN_CONTEXT"] = "summarize"
 	want = "OK main summarize at 150000 tokens, by Pi's summary, which keeps what its compaction.keepRecentTokens says; earlier turns' reasoning stripped"

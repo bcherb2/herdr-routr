@@ -264,7 +264,7 @@ func (a *app) flowStart(args []string) error {
 		if w.Fanout != nil {
 			fan = fmt.Sprintf(": one worker per file of %s, once the steps before it are done", w.Fanout.Glob)
 		}
-		fmt.Fprintf(a.stderr, "routr: queued %s (%s) step %s%s\n", w.Label(), w.Tag(), w.Step, fan)
+		fmt.Fprintf(a.stderr, "routr: queued %s (%s) step %s%s%s\n", w.Label(), w.Tag(), w.Step, fan, registryNote(p))
 	}
 	if *wait {
 		return a.waitFor(p, target{chain: name}, *timeout, c.json)

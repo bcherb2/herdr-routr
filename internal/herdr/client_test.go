@@ -231,6 +231,19 @@ func TestListsAndProcessInfo(t *testing.T) {
 	}
 }
 
+func TestPingDecodesVersionAndProtocol(t *testing.T) {
+	fs := newFakeServer(t, func(req request, w *json.Encoder) {
+		ok(w, req.ID, map[string]any{"type": "pong", "version": "0.9.5", "protocol": 22, "capabilities": map[string]any{"live_handoff": true}})
+	})
+	s, err := New(fs.sock).Ping(context.Background())
+	if err != nil || s != (Server{Version: "0.9.5", Protocol: 22}) {
+		t.Errorf("ping = %+v, %v", s, err)
+	}
+	if m := fs.lastParams(); m["_method"] != "ping" {
+		t.Errorf("method = %v", m["_method"])
+	}
+}
+
 func TestReachableUnreachableDenied(t *testing.T) {
 	fs := newFakeServer(t, func(request, *json.Encoder) {})
 	ctx := context.Background()

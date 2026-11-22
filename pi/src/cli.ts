@@ -16,12 +16,13 @@ export function routrBin(env: NodeJS.ProcessEnv = process.env): string {
 	return env.ROUTR_BIN?.trim() || "routr";
 }
 
-export function runRoutr(args: readonly string[], cwd: string, timeoutMs = 15_000): Promise<RunResult> {
+/** Runs routr in cwd; `registry`, another repo's .routr directory, for a command about a worker there. */
+export function runRoutr(args: readonly string[], cwd: string, timeoutMs = 15_000, registry?: string): Promise<RunResult> {
 	return new Promise((resolve) => {
 		execFile(
 			routrBin(),
 			[...args],
-			{ cwd, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024, env: process.env },
+			{ cwd, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024, env: registry ? { ...process.env, ROUTR_STATE_DIR: registry } : process.env },
 			(err, stdout, stderr) => {
 				const e = err as (NodeJS.ErrnoException & { code?: number | string }) | null;
 				const missing = e?.code === "ENOENT";

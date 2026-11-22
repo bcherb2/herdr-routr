@@ -19,6 +19,7 @@
 //	routr flow list|show NAME|start NAME   named flows (skills/routr/flows.md)
 //	routr roles                        roles as resolved from config
 //	routr watch [--foreground]         the watcher
+//	routr setup [--bin-dir D] [--dry-run]  link routr onto PATH, write config, check
 //	routr doctor / version             check the setup / the build
 //	routr hook --log FILE EVENT        Claude hook sink
 //
@@ -81,11 +82,15 @@ type app struct {
 	build  buildInfo // what this binary was built from
 
 	dial  func(socket string) worker.Driver
-	reach func(ctx context.Context, socket string) error // can this process connect to herdr?
-	spawn func(p registry.Paths) error                   // start the watcher unless one runs
+	reach func(ctx context.Context, socket string) error                 // can this process connect to herdr?
+	ping  func(ctx context.Context, socket string) (herdr.Server, error) // which herdr answers there?
+	spawn func(p registry.Paths) error                                   // start the watcher unless one runs
 	ready config.ReadyFunc
 	now   func() time.Time
 	poll  time.Duration // how often wait re-reads the registry
+	proc  string        // where setup finds watchers on an old binary (/proc); "" skips that
+
+	toldUnknown bool // the config's unknown keys were reported; one warning per command
 }
 
 func main() {
@@ -108,9 +113,15 @@ func newApp() *app {
 			defer cancel()
 			return herdr.New(socket).Reachable(ctx)
 		},
+		ping: func(ctx context.Context, socket string) (herdr.Server, error) {
+			ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			defer cancel()
+			return herdr.New(socket).Ping(ctx)
+		},
 		ready: config.Ready,
 		now:   time.Now,
 		poll:  250 * time.Millisecond,
+		proc:  "/proc",
 	}
 	a.spawn = func(p registry.Paths) error { return watch.Spawn(p, a.bin) }
 	return a
@@ -142,6 +153,7 @@ var commands = map[string]command{
 	"fallback": {(*app).fallback, "routr fallback HARNESS:MODEL [--error MSG]", "Show the [[fallback]] rule for a model: the models its work moves to, in order, when it fails in a way waiting won't fix. --error says whether MSG, the API error it failed with, is one. A front end asks this when its model fails."},
 	"config":   {(*app).configCmd, "routr config [init|example]", "List the config files routr reads (yours, then the repo's) and whether each exists. init writes yours, with every key commented out and explained, when you have none; example prints that template."},
 	"watch":    {(*app).watchCmd, "routr watch [--foreground]", "Start the repo's watcher, which drives the workers. Other commands start it when needed."},
+	"setup":    {(*app).setup, "routr setup [--bin-dir ~/.local/bin] [--dry-run] [--socket S]", "Put routr's own pieces in place: link this binary into --bin-dir, write the user config as config init does, and restart idle watchers still on an old binary. Check herdr and each harness, and print the command that adds routr's front end to each harness found; it installs and registers nothing outside routr. --dry-run prints the plan. Exit 1 only if a piece of routr's could not be put in place."},
 	"doctor":   {(*app).doctor, "routr doctor [--socket S]", "Check what routr needs (herdr, harnesses, config, registry, whether this binary is current), with the next step for each problem. Exit 1 if a check fails."},
 	"version":  {(*app).version, "routr version", "Print the git revision this binary was built from, whether it had uncommitted changes, and the checkout install.sh built it from."},
 }
@@ -166,6 +178,7 @@ var examples = map[string][]string{
 	"main":     {"routr main", "routr main --json", "ROUTR_MAIN_AT=-1 routr main   # what one run with no threshold of ours would apply"},
 	"fallback": {"routr fallback claude:opus", "routr fallback pi:deepseek/deepseek-v4-pro --error '402: Insufficient Balance' --json"},
 	"config":   {"routr config", "routr config init", "routr config example > my-config.toml"},
+	"setup":    {"routr setup --dry-run", "routr setup --bin-dir ~/bin"},
 	"doctor":   {"routr doctor", "routr doctor --json"},
 	"version":  {"routr version", "routr version --json"},
 }
@@ -231,7 +244,7 @@ func (a *app) help(w io.Writer) {
 }
 
 // commandOrder is the order help lists the commands in.
-var commandOrder = []string{"start", "wait", "result", "send", "done", "list", "show", "hide", "close", "approve", "answer", "retry", "cancel", "flow", "roles", "main", "fallback", "config", "watch", "doctor", "version"}
+var commandOrder = []string{"start", "wait", "result", "send", "done", "list", "show", "hide", "close", "approve", "answer", "retry", "cancel", "flow", "roles", "main", "fallback", "config", "watch", "setup", "doctor", "version"}
 
 // commandHelp is `routr CMD --help`: the usage line, each of fs's flags
 // with what it does and its default, and examples.
@@ -340,7 +353,15 @@ func (a *app) retention(p registry.Paths) registry.Retention {
 }
 
 func (a *app) loadConfig(p registry.Paths) (config.Config, error) {
-	return config.Load(userConfig(a.getenv), p.Config())
+	cfg, err := config.Load(userConfig(a.getenv), p.Config())
+	if len(cfg.Unknown) > 0 && !a.toldUnknown {
+		a.toldUnknown = true
+		for _, u := range cfg.Unknown {
+			fmt.Fprintf(a.stderr, "routr: ignoring unknown keys in %s\n", u)
+		}
+		fmt.Fprintf(a.stderr, "routr: a typo, or a key from a newer routr than this one (%s); routr doctor checks the config\n", a.build.short())
+	}
+	return cfg, err
 }
 
 // applyConfig loads the config and applies its [env] to this process, so

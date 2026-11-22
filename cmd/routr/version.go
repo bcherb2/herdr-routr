@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"runtime/debug"
 	"strings"
 )
@@ -92,7 +93,7 @@ func (a *app) checkBuild(add func(name, status, detail, fix string)) {
 	}
 	name, rebuild := "routr "+b.short(), "commit them and run install.sh again"
 	if b.Src != "" {
-		rebuild = "run " + b.Src + "/install.sh"
+		rebuild = a.updateHint()
 	}
 	dirty := ""
 	if b.Modified {
@@ -119,6 +120,33 @@ func (a *app) checkBuild(add func(name, status, detail, fix string)) {
 	default:
 		add("build", "ok", name+" is current with "+b.Src, "")
 	}
+}
+
+// updateHint is how to put a newer routr in place: herdr updates its
+// plugin installs, and install.sh rebuilds from a checkout.
+func (a *app) updateHint() string {
+	switch {
+	case a.pluginInstall(a.build.Src):
+		return "run herdr plugin update routr"
+	case a.build.Src != "":
+		return "run " + a.build.Src + "/install.sh"
+	}
+	return "rebuild routr from its source"
+}
+
+// pluginInstall reports whether root is a plugin herdr installed (and so
+// updates), which it keeps under plugins/ in its config directory. A
+// checkout linked with herdr plugin link is not one.
+func (a *app) pluginInstall(root string) bool {
+	if root == "" {
+		return false
+	}
+	cfg := a.getenv("XDG_CONFIG_HOME")
+	if cfg == "" {
+		cfg = filepath.Join(a.getenv("HOME"), ".config")
+	}
+	rel, err := filepath.Rel(filepath.Join(cfg, "herdr", "plugins"), root)
+	return err == nil && rel != "." && !strings.HasPrefix(rel, "..")
 }
 
 // gitErr is a failed git command's own message, when it gave one.

@@ -241,6 +241,11 @@ type Worker struct {
 	HandedTo    string    `json:"handed_to,omitempty"`
 	Answer      string    `json:"answer,omitempty"`
 	AnsweredBy  string    `json:"answered_by,omitempty"`
+	// Unanswered is the question it was blocked on when it went idle
+	// (maybe_done) with no answer through routr: dismissed or refused in
+	// its tab. The tool call it was about, else its first line; cleared
+	// when it works again.
+	Unanswered string `json:"unanswered,omitempty"`
 
 	// A turn the harness ended with an API error instead of a reply. The
 	// watcher retries a transient one (TurnError is set, Retry is when the

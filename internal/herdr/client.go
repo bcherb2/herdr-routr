@@ -3,7 +3,7 @@
 // The protocol is newline-delimited JSON over a Unix socket: one request
 // {id, method, params} per connection, answered by {id, result} or {id, error}.
 // events.subscribe keeps its connection open and streams {event, data} lines.
-// Method and field names follow `herdr api schema --json` (protocol 22).
+// Method and field names follow `herdr api schema --json` (Protocol).
 package herdr
 
 import (
@@ -79,6 +79,28 @@ func (c *Client) Reachable(ctx context.Context) error {
 		return fmt.Errorf("herdr: dial %s: %w", c.socket, err)
 	}
 	return conn.Close()
+}
+
+// Protocol is the socket protocol routr is written against: the number
+// `herdr api schema --json` and ping report.
+const Protocol = 22
+
+// MinVersion is the first herdr release that speaks Protocol (its
+// src/protocol/wire.rs PROTOCOL_VERSION; 0.8.2 spoke 20). The plugin
+// manifest's min_herdr_version says the same.
+const MinVersion = "0.9.0"
+
+// Server is what a running herdr server says of itself.
+type Server struct {
+	Version  string `json:"version"`
+	Protocol int    `json:"protocol"`
+}
+
+// Ping asks the server for its version and protocol.
+func (c *Client) Ping(ctx context.Context) (Server, error) {
+	var s Server
+	err := c.call(ctx, "ping", nil, &s)
+	return s, err
 }
 
 type request struct {

@@ -4,7 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,6 +22,8 @@ function mockPi() {
 	const shortcuts = new Map<string, any>();
 	const renderers = new Map<string, any>();
 	const pi = {
+		// Pi cuts nothing shorter than this; the sessions here are small (a test can set its own)
+		getSettings: () => ({ compaction: { keepRecentTokens: 100 } }),
 		on: (name: string, h: Handler) => handlers.set(name, [...(handlers.get(name) ?? []), h]),
 		sendMessage: (message: any, options: any) => sent.push({ message, options }),
 		sendUserMessage: (text: string) => sent.push({ message: { user: text }, options: {} }),
@@ -54,7 +56,7 @@ function mockCtx(cwd: string) {
 		mode: "tui",
 		hasUI: true,
 		isIdle: () => true,
-		sessionManager: { getSessionId: () => "S1", getEntries: () => [] },
+		sessionManager: { getSessionId: () => "S1", getEntries: () => [], getBranch: (): any[] => [] },
 		ui: {
 			theme,
 			setWidget: (k: string, v: any) => widgets.set(k, v),
@@ -219,6 +221,89 @@ test("workers recorded to this session are mine; a running routr wait holds thei
 	assert.deepEqual(wake.message.details.entries.map((e: any) => e.id), [8]);
 	await sleep(2000);
 	assert.equal(wakes().length, 1);
+});
+
+// The model queued a worker in another repo (cd ../other && routr start …):
+// the extension lists that repo's registry too, and wakes for it, and never
+// for the worker with the same id in its own.
+test("a worker queued in another repo's registry wakes the model; the same id at home does not", { timeout: 40_000 }, async (t) => {
+	const cwd = mkdtempSync(join(tmpdir(), "routr-pi-ext-"));
+	const other = mkdtempSync(join(tmpdir(), "routr-pi-other-"));
+	const otherDir = join(other, ".routr");
+	const env = { ...process.env, ROUTR_STATE_DIR: join(cwd, ".routr"), FAKE_ROUTR_RUN_SECS: "3", PI_SESSION_ID: "S-other" };
+	Object.assign(process.env, { ROUTR_BIN: fake, ROUTR_STATE_DIR: env.ROUTR_STATE_DIR, FAKE_ROUTR_RUN_SECS: "3", ROUTR_PI_WAKE: "mine", ROUTR_PI_VIEW: "cards" });
+	// home's own worker 7: another session's
+	execFileSync(fake, ["start", "--role", "task", "home's"], { cwd, env, stdio: "ignore" });
+
+	const { default: routr } = await import("../src/index.ts");
+	const m = mockPi();
+	routr(m.pi as any);
+	const u = mockCtx(cwd);
+	t.after(() => m.fire("session_shutdown", {}, u.ctx));
+	const wakes = () => m.sent.filter((s) => s.message.customType === "routr-wake");
+	const calls = (d: string) => readFileSync(join(d, "fake-calls.log"), "utf8");
+	debug = () => `widget:\n${u.widgetText()}\nwakes: ${JSON.stringify(wakes().map((s) => s.message.content))}\nnotes: ${u.notes.join(" | ")}`;
+
+	m.fire("session_start", { reason: "startup" }, u.ctx);
+	await until("home's 7 on its card", () => /7 task/.test(u.widgetText()));
+	m.fire("agent_start", {}, u.ctx);
+	// the model's shell: cd there and start one, recorded to no session (the claims find it)
+	const { PI_SESSION_ID: _, ...noSession } = env;
+	const out = execFileSync("sh", ["-c", `${fake} start --role review x 2>&1`], { cwd: other, env: { ...noSession, ROUTR_STATE_DIR: otherDir }, encoding: "utf8" });
+	assert.match(out, new RegExp(`^routr: queued worker 7 review .*; registry ${otherDir}\\n7\\n$`));
+	const command = `cd ${other} && routr start --role review x`;
+	m.fire("tool_call", { toolName: "bash", toolCallId: "c1", input: { command } }, u.ctx);
+	m.fire("tool_result", { toolName: "bash", toolCallId: "c1", input: { command }, content: [{ type: "text", text: out }] }, u.ctx);
+	assert.deepEqual(m.entries.at(-1), { customType: "routr-claims", data: { ids: [7], chains: [], group: "run:1", registry: realpathSync(otherDir) } });
+	m.fire("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] }, u.ctx);
+
+	const card = await until("the other repo's 7 on its card", () => (/7 review @routr-pi-other-\w+/.test(u.widgetText()) ? u.widgetText() : undefined));
+	assert.match(card, /7 task · claude/, "home's 7 too, apart");
+	const wake = await until("the wake for the other repo's 7", () => wakes()[0]);
+	assert.match(wake.message.content, /^\[routr\] worker 7 · review · codex·gpt-6-astra·high @routr-pi-other-\w+ is done, verdict fail\./);
+	assert.ok(wake.message.content.includes(`run routr commands about it as \`cd ${realpathSync(other)} && routr …\``), wake.message.content);
+	assert.match(wake.message.content, /Two findings; one blocks implementation\./, "its result, read from its registry");
+	assert.match(calls(otherDir), /list --json[\s\S]*result 7/);
+	await until("home's 7 done", () => /7 task · claude.* done/.test(u.widgetText()));
+	await new Promise((r) => setTimeout(r, 2000));
+	assert.equal(wakes().length, 1, "home's 7 is another session's: no wake");
+	const lists = calls(otherDir).split("list --json").length;
+	await new Promise((r) => setTimeout(r, 6000));
+	assert.equal(calls(otherDir).split("list --json").length, lists, "its worker is done with: that registry is no longer listed");
+});
+
+// The overnight run of 2026-11-03: the model started workers in another repo
+// as `ID=$(routr start … 2>log); echo "x=$ID $(cat log)"`, so no line of the
+// output starts "routr: queued". The registry the call ran in, and routr's
+// caller.session, still say whose they are.
+test("a worker queued in another repo wakes the model though the output names it on no line of its own", { timeout: 40_000 }, async (t) => {
+	const cwd = mkdtempSync(join(tmpdir(), "routr-pi-ext-"));
+	const other = mkdtempSync(join(tmpdir(), "routr-pi-other-"));
+	const otherDir = join(other, ".routr");
+	const env = { ...process.env, ROUTR_STATE_DIR: join(cwd, ".routr"), FAKE_ROUTR_RUN_SECS: "3", PI_SESSION_ID: "S1" };
+	Object.assign(process.env, { ROUTR_BIN: fake, ROUTR_STATE_DIR: env.ROUTR_STATE_DIR, FAKE_ROUTR_RUN_SECS: "3", ROUTR_PI_WAKE: "mine", ROUTR_PI_VIEW: "cards" });
+
+	const { default: routr } = await import("../src/index.ts");
+	const m = mockPi();
+	routr(m.pi as any);
+	const u = mockCtx(cwd);
+	t.after(() => m.fire("session_shutdown", {}, u.ctx));
+	const wakes = () => m.sent.filter((s) => s.message.customType === "routr-wake");
+	debug = () => `widget:\n${u.widgetText()}\nwakes: ${JSON.stringify(wakes().map((s) => s.message.content))}\nnotes: ${u.notes.join(" | ")}`;
+
+	m.fire("session_start", { reason: "startup" }, u.ctx);
+	await new Promise((r) => setTimeout(r, 300));
+	m.fire("agent_start", {}, u.ctx);
+	const command = `ID=$(routr start --root ${other} --role review x 2>/tmp/e1); echo "x=$ID $(cat /tmp/e1)"`;
+	const out = execFileSync("sh", ["-c", `ID=$(${fake} start --role review x 2>&1 >/dev/null); echo "x=7 $ID"`], { cwd: other, env: { ...env, ROUTR_STATE_DIR: otherDir }, encoding: "utf8" });
+	assert.match(out, /^x=7 routr: queued worker 7 review/);
+	m.fire("tool_call", { toolName: "bash", toolCallId: "c1", input: { command } }, u.ctx);
+	m.fire("tool_result", { toolName: "bash", toolCallId: "c1", input: { command }, content: [{ type: "text", text: out }] }, u.ctx);
+	assert.deepEqual(m.entries.at(-1), { customType: "routr-claims", data: { ids: [], chains: [], group: "run:1", registry: realpathSync(otherDir) } });
+	m.fire("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] }, u.ctx);
+
+	const wake = await until("the wake for the other repo's 7", () => wakes()[0]);
+	assert.match(wake.message.content, /^\[routr\] worker 7 · review .* is done/);
 });
 
 test("news during a turn waits for its end; after the user interrupts it, until their next turn ends", { timeout: 40_000 }, async (t) => {
@@ -658,6 +743,24 @@ test("the skill it ships loads in Pi, with no diagnostics", async () => {
 	assert.deepEqual(skills.map((s) => s.name), ["routr"]);
 });
 
+test("the main agent asks for Pi's long prompt cache unless PI_CACHE_RETENTION says otherwise; a worker doesn't", async (t) => {
+	const keys = ["ROUTR_ID", "PI_CACHE_RETENTION"] as const;
+	const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+	t.after(() => {
+		for (const k of keys) saved[k] === undefined ? delete process.env[k] : (process.env[k] = saved[k]);
+	});
+	const { default: routr } = await import("../src/index.ts");
+	const loaded = (env: Record<string, string>) => {
+		for (const k of keys) delete process.env[k];
+		Object.assign(process.env, env);
+		routr(mockPi().pi as any);
+		return process.env.PI_CACHE_RETENTION;
+	};
+	assert.equal(loaded({}), "long", "the main agent: an hour");
+	assert.equal(loaded({ PI_CACHE_RETENTION: "short" }), "short", "set off: left alone");
+	assert.equal(loaded({ ROUTR_ID: "12" }), undefined, "a worker: Pi's default");
+});
+
 test("the main agent strips earlier reasoning as routr main says: not for a worker, another API, or strip_reasoning false", async (t) => {
 	const keys = ["ROUTR_ID", "ROUTR_MAIN_STRIP_REASONING", "FAKE_ROUTR_MAIN", "ROUTR_BIN", "ROUTR_STATE_DIR"] as const;
 	const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
@@ -731,7 +834,8 @@ test("past [main] at, the main agent's context is cut once its run settles: no m
 	const m = mockPi();
 	routr(m.pi as any);
 	const u = mockCtx(cwd);
-	const branch = branchOf("Read .design/brief.md and carry it out.", "two", "three");
+	// ~1300 tokens as Pi estimates them, as many as the provider counted: the cut [main] asks for leaves it well under at
+	const branch = branchOf("Read .design/brief.md and carry it out.", ...Array.from({ length: 11 }, (_, i) => `turn ${i + 2}`));
 	let tokens = 900;
 	const compacts: any[] = [];
 	Object.assign(u.ctx, {
@@ -761,19 +865,72 @@ test("past [main] at, the main agent's context is cut once its run settles: no m
 	assert.equal(compacts.length, 1, "one cut at a time");
 
 	// Pi runs the compaction it was asked for: routr answers it
-	const [answer] = await Promise.all(m.fire("session_before_compact", { reason: "manual", branchEntries: branch, preparation: { tokensBefore: 1200 } }, u.ctx));
-	assert.equal(answer.compaction.firstKeptEntryId, "e5", "the last turn");
-	assert.match(answer.compaction.summary, /began with this message \(re-read any file it names\):\n\nRead \.design\/brief\.md and carry it out\./);
+	const [answer] = await Promise.all(m.fire("session_before_compact", { reason: "manual", branchEntries: branch, preparation: { tokensBefore: 1300 } }, u.ctx));
+	assert.equal(answer.compaction.firstKeptEntryId, "e23", "the last turn");
+	// routr main printed no keep_head (a routr from before it): on, so the first turn is kept in front of the note
+	assert.equal(answer.compaction.details.head.endId, "e2");
+	assert.match(answer.compaction.summary, /^routr cut the conversation between the session's first turn and its last turns/);
+	assert.doesNotMatch(answer.compaction.summary, /brief\.md/, "the first message is in the head, not the note");
 	assert.match(answer.compaction.summary, /#7 review — /, "this session's worker");
 
 	await until("7 done on its card", () => /7 review .* done/.test(u.widgetText()));
 	await new Promise((r) => setTimeout(r, 1500));
 	assert.equal(wakes().length, 0, "a wake turn now would race the cut");
-	compacts[0].onComplete({ tokensBefore: 1200, estimatedTokensAfter: 300 });
+	compacts[0].onComplete({ tokensBefore: 1200, estimatedTokensAfter: 300, details: { ...answer.compaction.details, head: { ...answer.compaction.details.head, tokens: 150 } } });
 	m.fire("session_compact", { reason: "manual", fromExtension: true }, u.ctx);
-	assert.match(u.notes.join("\n"), /routr: cut the context from 1200 to about 300 tokens/);
+	assert.match(u.notes.join("\n"), /routr: cut the context from 1200 to about 450 tokens/, "Pi's estimate and the first turn sent in front of the note");
 	const wake = await until("the wake, once the cut is done", () => wakes()[0]);
 	assert.deepEqual(wake.message.details.entries.map((e: any) => e.id), [7]);
+});
+
+test("a cut that left the context over [main] at is not tried again every turn: only once it has grown a tenth", async (t) => {
+	const keys = ["ROUTR_ID", "FAKE_ROUTR_MAIN", "ROUTR_BIN", "ROUTR_STATE_DIR"] as const;
+	const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+	t.after(() => {
+		for (const k of keys) saved[k] === undefined ? delete process.env[k] : (process.env[k] = saved[k]);
+	});
+	const cwd = mkdtempSync(join(tmpdir(), "routr-pi-again-"));
+	delete process.env.ROUTR_ID;
+	Object.assign(process.env, {
+		ROUTR_BIN: fake,
+		ROUTR_STATE_DIR: join(cwd, ".routr"),
+		FAKE_ROUTR_MAIN: JSON.stringify({ context: "truncate", at: 1000, keep_turns: 1, keep_tokens: 500, strip_reasoning: true }),
+	});
+	const { default: routr } = await import("../src/index.ts");
+	const m = mockPi();
+	routr(m.pi as any);
+	const u = mockCtx(cwd);
+	const branch = branchOf("brief", ...Array.from({ length: 11 }, (_, i) => `turn ${i + 2}`));
+	let tokens = 1200;
+	const compacts: any[] = [];
+	Object.assign(u.ctx, {
+		getContextUsage: () => ({ tokens, contextWindow: 1_000_000, percent: 0 }),
+		hasPendingMessages: () => false,
+		compact: (o: any) => compacts.push(o),
+		sessionManager: { ...u.ctx.sessionManager, getBranch: () => branch },
+	});
+	t.after(() => m.fire("session_shutdown", {}, u.ctx));
+	m.fire("session_start", { reason: "startup" }, u.ctx);
+	const settle = () => Promise.all(m.fire("agent_settled", { type: "agent_settled" }, u.ctx));
+	const done = async (prompt: number) => {
+		compacts.at(-1).onComplete({ tokensBefore: tokens, details: { by: "routr" } });
+		m.fire("session_compact", { type: "session_compact", compactionEntry: { details: { by: "routr" } }, fromExtension: true, reason: "manual", willRetry: false }, u.ctx);
+		await Promise.all(m.fire("message_end", { type: "message_end", message: { role: "assistant", stopReason: "stop", content: [], usage: { input: 0, cacheRead: prompt, cacheWrite: 0, output: 50 } } }, u.ctx));
+	};
+
+	await settle();
+	assert.equal(compacts.length, 1);
+	await done(1100); // the provider counted more than the cut was sized for
+	tokens = 1150;
+	await settle();
+	assert.equal(compacts.length, 1, "1150 is within a tenth of the 1100 the cut left");
+	tokens = 1250;
+	await settle();
+	assert.equal(compacts.length, 2, "grown a tenth: cut again");
+	await done(600);
+	tokens = 1050;
+	await settle();
+	assert.equal(compacts.length, 3, "a cut that came in under at sets no floor; past at again, cut again");
 });
 
 test("which compactions routr answers: Pi's own near the window, never the user's /compact or a worker's; summarize and off leave Pi's", async (t) => {
@@ -826,7 +983,7 @@ test("which compactions routr answers: Pi's own near the window, never the user'
 	assert.equal((await session({ FAKE_ROUTR_MAIN: few }, "threshold")).answer, undefined);
 });
 
-test("Pi refusing a cut for its keepRecentTokens is said once a session, with why", async (t) => {
+test("Pi refusing a cut routr thought it would take is said once a session, with why", async (t) => {
 	const keys = ["ROUTR_ID", "FAKE_ROUTR_MAIN", "ROUTR_BIN", "ROUTR_STATE_DIR"] as const;
 	const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
 	t.after(() => {
@@ -837,13 +994,13 @@ test("Pi refusing a cut for its keepRecentTokens is said once a session, with wh
 	Object.assign(process.env, { ROUTR_BIN: fake, ROUTR_STATE_DIR: join(cwd, ".routr") });
 	const { default: routr } = await import("../src/index.ts");
 	const m = mockPi();
-	Object.assign(m.pi, { getSettings: () => ({ compaction: { keepRecentTokens: 30_000 } }) });
+	Object.assign(m.pi, { getSettings: () => ({ compaction: { keepRecentTokens: 300 } }) });
 	routr(m.pi as any);
 	const u = mockCtx(cwd);
 	u.ctx.mode = "print";
 	const branch = branchOf("brief", "a", "b", "c", "d");
 	let tokens = 200_000;
-	let tries = 0;
+	let tries = 0; // past 300 tokens: routr's dry run passes, and this Pi refuses all the same
 	Object.assign(u.ctx, {
 		getContextUsage: () => ({ tokens, contextWindow: 1_000_000, percent: 20 }),
 		hasPendingMessages: () => false,
@@ -858,8 +1015,151 @@ test("Pi refusing a cut for its keepRecentTokens is said once a session, with wh
 	assert.equal(tries, 2, "a tenth more: try again");
 	m.fire("session_shutdown", {}, u.ctx);
 	const told = u.notes.filter((n) => /nothing to cut yet/.test(n));
-	assert.deepEqual(told, ["routr: nothing to cut yet: Pi always keeps the last 30000 tokens of conversation (compaction.keepRecentTokens), and [main] at counts the system prompt too"]);
+	assert.deepEqual(told, ["routr: nothing to cut yet: Pi always keeps the last 300 tokens of conversation (compaction.keepRecentTokens), and [main] at counts the system prompt too"]);
 	assert.equal(u.notes.filter((n) => /the context is at/.test(n)).length, 1, "it tries after each turn, quietly: the conversation grows past it");
+});
+
+test("while Pi would refuse the cut (its keepRecentTokens for this model), routr asks for none and says nothing", async (t) => {
+	const keys = ["ROUTR_ID", "FAKE_ROUTR_MAIN", "ROUTR_BIN", "ROUTR_STATE_DIR"] as const;
+	const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+	t.after(() => {
+		for (const k of keys) saved[k] === undefined ? delete process.env[k] : (process.env[k] = saved[k]);
+	});
+	const cwd = mkdtempSync(join(tmpdir(), "routr-pi-cut-"));
+	for (const k of ["ROUTR_ID", "FAKE_ROUTR_MAIN"]) delete process.env[k];
+	Object.assign(process.env, { ROUTR_BIN: fake, ROUTR_STATE_DIR: join(cwd, ".routr") });
+	const { default: routr } = await import("../src/index.ts");
+	const m = mockPi();
+	Object.assign(m.pi, { getSettings: () => ({ compaction: { keepRecentTokens: 100, modelOverrides: { "anthropic/claude-opus-5-5": { keepRecentTokens: 30_000 } } } }) });
+	routr(m.pi as any);
+	const u = mockCtx(cwd);
+	u.ctx.mode = "print";
+	let branch = branchOf("brief", "a", "b", "c", "d"); // ~500 tokens of conversation
+	const compacts: any[] = [];
+	Object.assign(u.ctx, {
+		model: { provider: "anthropic", id: "claude-opus-5-5", api: "anthropic-messages" },
+		getContextUsage: () => ({ tokens: 200_000, contextWindow: 1_000_000, percent: 20 }),
+		hasPendingMessages: () => false,
+		compact: (o: any) => compacts.push(o),
+		sessionManager: { ...u.ctx.sessionManager, getBranch: () => branch },
+	});
+	m.fire("session_start", { reason: "startup" }, u.ctx);
+	for (let i = 0; i < 3; i++) await Promise.all(m.fire("agent_settled", { type: "agent_settled" }, u.ctx));
+	assert.equal(compacts.length, 0, "the model's override, 30000, not the 100 of every model");
+	assert.deepEqual(u.notes, [], "nothing to say: the conversation grows past it");
+	branch = branchOf("brief", ...Array.from({ length: 300 }, (_, i) => `turn ${i}`)); // ~32k
+	await Promise.all(m.fire("agent_settled", { type: "agent_settled" }, u.ctx));
+	assert.equal(compacts.length, 1);
+	assert.match(u.notes.join("\n"), /routr: the context is at 200000 tokens, past 150000; keeping the last 3 turns/);
+	m.fire("session_shutdown", {}, u.ctx);
+});
+
+test("after a cut that kept the first turn, every request of the main agent has it in front of the note, with its own cache breakpoint on Anthropic", async (t) => {
+	const keys = ["ROUTR_ID", "FAKE_ROUTR_MAIN", "ROUTR_BIN", "ROUTR_STATE_DIR"] as const;
+	const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+	t.after(() => {
+		for (const k of keys) saved[k] === undefined ? delete process.env[k] : (process.env[k] = saved[k]);
+	});
+	const cwd = mkdtempSync(join(tmpdir(), "routr-pi-head-"));
+	for (const k of ["ROUTR_ID", "FAKE_ROUTR_MAIN"]) delete process.env[k];
+	Object.assign(process.env, { ROUTR_BIN: fake, ROUTR_STATE_DIR: join(cwd, ".routr") });
+	const { buildSessionProjection } = await import("@earendil-works/pi-coding-agent");
+	const { default: routr } = await import("../src/index.ts");
+	const m = mockPi();
+	routr(m.pi as any);
+	const u = mockCtx(cwd);
+	u.ctx.mode = "print";
+	const branch: any[] = branchOf("Read .design/brief.md and carry it out.", "a", "b", "c", "d");
+	Object.assign(u.ctx, { sessionManager: { ...u.ctx.sessionManager, getBranch: () => branch } });
+	m.fire("session_start", { reason: "startup" }, u.ctx);
+	const [answer] = await Promise.all(m.fire("session_before_compact", { reason: "threshold", branchEntries: branch, preparation: { tokensBefore: 200_000 } }, u.ctx));
+	const c = answer.compaction;
+	assert.equal(c.details.head.endId, "e2", "the built-in [main]: keep_head on");
+	const at = (api: string, extra: object = {}) => ({ ...u.ctx, model: { provider: "p", id: "m", api }, ...extra });
+	/** the main agent's next request, as the context hook leaves it */
+	const context = async (api: string) => {
+		const messages = buildSessionProjection(branch).messages.filter((x: any) => x.role !== "system");
+		const out = await m.fire("context", { type: "context", messages }, at(api))[0];
+		return { messages, out };
+	};
+	const before = await context("anthropic-messages");
+	assert.equal(before.out, undefined, "no cut yet: nothing to put back");
+
+	branch.push({ type: "compaction", id: "c1", parentId: "e10", timestamp: new Date(11_000).toISOString(), summary: c.summary, firstKeptEntryId: c.firstKeptEntryId, tokensBefore: 200_000, details: c.details, fromHook: true });
+	branch.push({ type: "custom_message", id: "w1", parentId: "c1", timestamp: new Date(12_000).toISOString(), customType: "routr-wake", content: "[routr] worker 7 is done", display: true });
+	for (const api of ["anthropic-messages", "openai-completions", "openai-responses"]) {
+		const { messages, out } = await context(api);
+		assert.deepEqual(
+			out.messages.map((x: any) => x.role),
+			["user", "assistant", "compactionSummary", "user", "assistant", "user", "assistant", "user", "assistant", "custom"],
+			api,
+		);
+		assert.equal(out.messages[0].content, "Read .design/brief.md and carry it out.");
+		assert.deepEqual(out.messages.slice(2), messages, "the rest as Pi built it");
+		assert.notEqual(out.messages[0], branch[0].message, "a copy: nothing that edits the request reaches the session");
+	}
+	process.env.ROUTR_ID = "12";
+	assert.equal((await context("anthropic-messages")).out, undefined, "a worker's context is its own");
+	delete process.env.ROUTR_ID;
+
+	// the request Pi's Anthropic converter builds from it
+	const NOTE = `The conversation history before this point was compacted into the following summary:\n\n<summary>\n${c.summary}\n</summary>`;
+	const eph = { type: "ephemeral" };
+	const payload = {
+		system: [{ type: "text", text: "s", cache_control: eph }],
+		messages: [
+			{ role: "user", content: "Read .design/brief.md and carry it out." },
+			{ role: "assistant", content: [{ type: "text", text: "brief: done" }] },
+			{ role: "user", content: [{ type: "text", text: NOTE }] },
+			{ role: "user", content: [{ type: "text", text: "[routr] worker 7 is done", cache_control: eph }] },
+		],
+	};
+	const req = (api: string) => m.fire("before_provider_request", { type: "before_provider_request", payload }, at(api))[0];
+	assert.deepEqual(req("anthropic-messages").messages[1].content, [{ type: "text", text: "brief: done", cache_control: eph }]);
+	assert.equal(req("openai-completions"), undefined, "not an Anthropic payload");
+	process.env.ROUTR_ID = "12";
+	assert.equal(req("anthropic-messages"), undefined, "nor for a worker");
+	delete process.env.ROUTR_ID;
+	m.fire("session_shutdown", {}, u.ctx);
+});
+
+test("the first answer after a cut still close to [main] at is said once a session: raise at, or keep less", async (t) => {
+	const keys = ["ROUTR_ID", "FAKE_ROUTR_MAIN", "ROUTR_BIN", "ROUTR_STATE_DIR"] as const;
+	const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+	t.after(() => {
+		for (const k of keys) saved[k] === undefined ? delete process.env[k] : (process.env[k] = saved[k]);
+	});
+	const cwd = mkdtempSync(join(tmpdir(), "routr-pi-big-"));
+	for (const k of ["ROUTR_ID", "FAKE_ROUTR_MAIN"]) delete process.env[k];
+	Object.assign(process.env, { ROUTR_BIN: fake, ROUTR_STATE_DIR: join(cwd, ".routr") });
+	const { default: routr } = await import("../src/index.ts");
+	const m = mockPi();
+	routr(m.pi as any);
+	const u = mockCtx(cwd);
+	u.ctx.mode = "print";
+	m.fire("session_start", { reason: "startup" }, u.ctx);
+	const cut = (by = "routr") => m.fire("session_compact", { type: "session_compact", compactionEntry: { details: by ? { by } : undefined }, fromExtension: true, reason: "manual", willRetry: false }, u.ctx);
+	const answer = (prompt: number, stopReason = "stop") =>
+		Promise.all(m.fire("message_end", { type: "message_end", message: { role: "assistant", stopReason, content: [], usage: { input: 1000, cacheRead: prompt - 3000, cacheWrite: 2000, output: 50 } } }, u.ctx));
+	const told = () => u.notes.filter((n) => /still/.test(n));
+
+	await answer(140_000);
+	assert.deepEqual(told(), [], "no cut: nothing to say");
+	cut();
+	await answer(100_000);
+	await answer(140_000);
+	assert.deepEqual(told(), [], "100k is within 80% of 150000; only the first answer after a cut counts");
+	cut("");
+	await answer(140_000);
+	assert.deepEqual(told(), [], "Pi's own summary, not routr's cut");
+	cut();
+	await answer(140_000, "error");
+	await answer(130_000);
+	assert.deepEqual(told(), ["routr: the context after the cut is still 130000 tokens, close to [main] at (150000); raise at, or lower keep_tokens (a lower head_tokens counts from a new session)"], "an answer that failed is passed over");
+	cut();
+	await answer(130_000);
+	assert.equal(told().length, 1, "once a session");
+	m.fire("session_shutdown", {}, u.ctx);
 });
 
 test("no cut right after the user interrupts a run, and a cut that throws still lets the wakes go", async (t) => {
@@ -1056,4 +1356,17 @@ test("a forced cut keeps at most half the new window, though [main] keeps everyt
 	s.compacts[0].onComplete({ tokensBefore: 170, estimatedTokensAfter: 250 });
 	assert.match(s.u.notes.join("\n"), /routr: the context \(250 tokens\) is still over pi:openrouter\/tiny's window of 200; Pi's overflow compaction takes it from here/);
 	assert.equal(s.resent().length, 1, "carried on all the same");
+});
+
+test("Pi's compaction after an overflow is held to half the window too; its compaction near the window is [main]'s", async (t) => {
+	const main = JSON.stringify({ context: "truncate", at: -1, keep_turns: -1, keep_tokens: -1, strip_reasoning: true });
+	const s = await fallbackSession(t, { FAKE_ROUTR_MAIN: main });
+	s.setModel(s.models["openrouter/tiny"]);
+	const fire = async (reason: string) =>
+		(await Promise.all(s.m.fire("session_before_compact", { reason, branchEntries: branchOf("brief", "a", "b"), preparation: { tokensBefore: 250 } }, s.u.ctx)))[0];
+	assert.equal(await fire("threshold"), undefined, "[main] keeps everything: Pi's summary");
+	const answer = await fire("overflow");
+	assert.ok(answer?.compaction, "a cut, where [main] alone would keep everything");
+	assert.equal(answer.compaction.details.split, true, "100 tokens: not even the last turn whole");
+	assert.equal(answer.compaction.details.head, undefined, "nor the first turn");
 });

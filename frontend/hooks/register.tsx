@@ -29,6 +29,8 @@ import {
 	parseContext,
 	parseLine,
 	parseList,
+	places,
+	placeKey,
 	question,
 	questionKey,
 	statusText,
@@ -37,9 +39,11 @@ import {
 	toCards,
 	toSteps,
 	waiting,
+	workerKey,
 	type ClaimsEntry,
 	type Notice,
 	type Paint,
+	type Place,
 	type QuestionContext,
 	type TurnEnd,
 	type WakeItem,
@@ -83,6 +87,10 @@ const pickerState = atom({ plugin: "routr", key: "picker" } as const, null as Pi
 let coord = new Coordinator();
 let sessionId = "";
 let cwd = "";
+/** the session's own registry (.routr directory), once found */
+let home: string | undefined;
+/** where routr calls at each place keep their registry (placeKey → .routr directory; undefined: can't tell), resolved before the Coordinator asks */
+const located = new Map<string, string | undefined>();
 let wakeMode: WakeMode = "mine";
 /** this repo has routr state, or the session ran routr: only then is `routr list` polled */
 let engaged = false;
@@ -93,8 +101,8 @@ let lastError = "";
 let drawn = "";
 /** background shells the model started, task id → command: their end arrives as a task notification */
 const background = new Map<string, string>();
-/** the last tool calls of each worker at work, read from its transcript's end when the file grew */
-const tails = new Map<number, { path: string; size: number; lines: string[] }>();
+/** the last tool calls of each worker at work (by workerKey), read from its transcript's end when the file grew */
+const tails = new Map<string, { path: string; size: number; lines: string[] }>();
 
 // ── Painting: the core lays out lines through a Paint; these turn its runs into Text ──
 
@@ -155,11 +163,11 @@ function row(Text: ElementConstructor<TextProps>, line: string) {
 
 // ── The CLI ──
 
-/** Runs routr; `missing` when the binary can't be started. */
-async function routr($: Engine, args: readonly string[]): Promise<{ code: number; stdout: string; stderr: string; missing: boolean }> {
+/** Runs routr, in another repo's `registry` for a worker there; `missing` when the binary can't be started. */
+async function routr($: Engine, args: readonly string[], registry?: string): Promise<{ code: number; stdout: string; stderr: string; missing: boolean }> {
 	const bin = (await $.env.get("ROUTR_BIN"))?.trim() || "routr";
 	try {
-		const r = await $.process.run([bin, ...args], { cwd, timeoutMs: 15_000 });
+		const r = await $.process.run([bin, ...args], { cwd, timeoutMs: 15_000, ...(registry ? { env: { ROUTR_STATE_DIR: registry } } : {}) });
 		return { code: r.exitCode, stdout: r.stdout, stderr: r.stderr, missing: false };
 	} catch (err) {
 		return { code: 1, stdout: "", stderr: `${bin}: ${err instanceof Error ? err.message : String(err)}`, missing: true };
@@ -178,6 +186,47 @@ async function hasState($: Engine): Promise<boolean> {
 		// not a git repo: the working directory's own
 	}
 	return $.fs.exists(`${cwd}/.routr/state`);
+}
+
+/** Path p as a shell in dir takes it (`~` is HOME), its real path when it exists, so registries compare; undefined for `~user`. */
+async function realPath($: Engine, dir: string, p: string): Promise<string | undefined> {
+	const abs = p === "~" || p.startsWith("~/") ? `${(await $.env.get("HOME")) ?? ""}${p.slice(1)}` : p.startsWith("~") ? undefined : p.startsWith("/") ? p : `${dir}/${p}`;
+	if (abs === undefined) return undefined;
+	try {
+		const r = await $.process.run(["realpath", abs], { timeoutMs: 3000 });
+		if (r.exitCode === 0 && r.stdout.trim()) return r.stdout.trim();
+	} catch {
+		// no realpath: as written
+	}
+	return abs;
+}
+
+/** The .routr directory for work in dir, by the CLI's rule (skills/routr/cli.md, "Where state lives"). */
+async function registryOf($: Engine, dir: string): Promise<string | undefined> {
+	const env = await $.env.get("ROUTR_STATE_DIR");
+	if (env) return realPath($, dir, env);
+	try {
+		const r = await $.process.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: dir, timeoutMs: 3000 });
+		const common = r.stdout.trim();
+		if (r.exitCode === 0 && common.endsWith("/.git")) return realPath($, "/", `${common.slice(0, -"/.git".length)}/.routr`);
+	} catch {
+		// not a git repo: the directory's own
+	}
+	return realPath($, "/", `${dir}/.routr`);
+}
+
+/** Resolves the places a routr call ran at or its output names (claims.ts), for the Coordinator's `locate`. */
+async function locatePlaces($: Engine, at: readonly Place[]): Promise<void> {
+	for (const p of at) {
+		const k = placeKey(p);
+		if (located.has(k)) continue;
+		if ("registry" in p) located.set(k, await realPath($, cwd, p.registry));
+		else if ("root" in p) located.set(k, await realPath($, cwd, `${p.root}/.routr`));
+		else {
+			const d = await realPath($, cwd, p.cwd);
+			located.set(k, d === undefined ? undefined : await registryOf($, d));
+		}
+	}
 }
 
 /** The claims kept for session `id`, oldest first. */
@@ -206,7 +255,15 @@ async function sync($: Engine): Promise<void> {
 	coord.end();
 	sessionId = id;
 	background.clear();
-	coord = new Coordinator({ sessionId: id, wakeMode, maxHoldMs: holdFromEnv(await $.env.get("ROUTR_WAKE_HOLD")), restored: await loadClaims($, id) });
+	home ??= await registryOf($, cwd);
+	coord = new Coordinator({
+		sessionId: id,
+		wakeMode,
+		maxHoldMs: holdFromEnv(await $.env.get("ROUTR_WAKE_HOLD")),
+		restored: await loadClaims($, id),
+		home,
+		locate: (at) => located.get(placeKey(at)),
+	});
 }
 
 // ── The view ──
@@ -222,7 +279,7 @@ async function refreshView($: Engine): Promise<void> {
 		lingerMs: LINGER_MS,
 		mine: (w: Worker) => coord.isMine(w),
 		answerHint: ANSWER_HINT,
-		activity: new Map([...tails].map(([id, t]) => [id, t.lines] as const)),
+		activity: new Map([...tails].map(([k, t]) => [k, t.lines] as const)),
 	};
 	const cards = toCards([...coord.workers], o);
 	const s = statusText(cards);
@@ -241,20 +298,20 @@ async function refreshView($: Engine): Promise<void> {
 /** Reads the end of each working worker's transcript that grew since the last read; says if any did. */
 async function readTails($: Engine): Promise<boolean> {
 	const want = coord.workers.filter((w) => w.transcript && (ACTIVE.has(w.state) || w.state === "blocked"));
-	for (const id of tails.keys()) if (!want.some((w) => w.id === id)) tails.delete(id);
+	for (const k of tails.keys()) if (!want.some((w) => workerKey(w) === k)) tails.delete(k);
 	const grew = await Promise.all(
 		want.map(async (w) => {
 			const path = w.transcript!;
 			try {
 				const { size } = await $.fs.stat(path);
-				const cur = tails.get(w.id);
+				const cur = tails.get(workerKey(w));
 				if (cur?.path === path && cur.size === size) return false;
 				const r = await $.process.run(["tail", "-c", String(TAIL_BYTES), path], { timeoutMs: 3000 });
 				if (r.exitCode !== 0) return false;
 				const lines = r.stdout.split("\n");
 				if (size > TAIL_BYTES) lines.shift(); // started mid-line
 				const acts = lines.flatMap((l) => parseLine(w.harness, l).flatMap((e) => activityLine(e) ?? []));
-				tails.set(w.id, { path, size, lines: acts.slice(-ACTIVITY_KEEP) });
+				tails.set(workerKey(w), { path, size, lines: acts.slice(-ACTIVITY_KEEP) });
 				return true;
 			} catch {
 				return false; // not written yet (the harness creates it after starting)
@@ -308,6 +365,23 @@ async function poll($: Engine): Promise<void> {
 		await pickerStands($, workers);
 		const c = coord;
 		const { wake, keep } = c.snapshot(workers);
+		// and the other repos' registries the model queued this session's workers in, while they are at work
+		for (const reg of c.elsewhere()) {
+			const o = await routr($, ["list", "--json"], reg);
+			let ws: Worker[] | undefined;
+			try {
+				ws = o.code === 0 ? parseList(o.stdout) : undefined;
+			} catch {
+				// told below
+			}
+			if (!ws) {
+				$.ui.log(`routr list in ${reg} failed: ${(o.stderr || o.stdout).trim().split("\n")[0] ?? ""}`, { to: "debug" });
+				continue;
+			}
+			const out = c.snapshot(ws, reg);
+			wake.push(...out.wake);
+			keep.push(...out.keep);
+		}
 		await saveClaims($, keep);
 		await refreshView($);
 		if (wake.length > 0) await deliver($, c, wake);
@@ -320,14 +394,14 @@ async function poll($: Engine): Promise<void> {
 
 /** What `routr result ID` prints, else what the list carried. */
 async function resultText($: Engine, w: Worker): Promise<string> {
-	const r = await routr($, ["result", String(w.id)]);
+	const r = await routr($, ["result", String(w.id)], w.registry);
 	if (r.code === 0 && r.stdout.trim()) return r.stdout;
 	return w.final ?? (r.stdout || r.stderr).trim();
 }
 
 /** Who answers a question and how (`routr show ID --context --json`); undefined if routr could not say. */
 async function questionContext($: Engine, w: Worker): Promise<QuestionContext | undefined> {
-	const r = await routr($, ["show", String(w.id), "--context", "--json"]);
+	const r = await routr($, ["show", String(w.id), "--context", "--json"], w.registry);
 	return r.code === 0 ? parseContext(r.stdout) : undefined;
 }
 
@@ -339,13 +413,13 @@ async function questionContext($: Engine, w: Worker): Promise<QuestionContext | 
  */
 async function deliver($: Engine, c: Coordinator, items: WakeItem[]): Promise<void> {
 	const want = c.wants(items);
-	const results = new Map<number, string>();
-	const contexts = new Map<number, QuestionContext>();
+	const results = new Map<string, string>();
+	const contexts = new Map<string, QuestionContext>();
 	await Promise.all([
-		...want.results.map(async (w) => results.set(w.id, await resultText($, w))),
+		...want.results.map(async (w) => results.set(workerKey(w), await resultText($, w))),
 		...want.contexts.map(async (w) => {
 			const q = await questionContext($, w);
-			if (q) contexts.set(w.id, q);
+			if (q) contexts.set(workerKey(w), q);
 		}),
 	]);
 	const wk = c.compose(items, results, contexts);
@@ -502,7 +576,7 @@ async function command($: Engine, args: string): Promise<void> {
 		cmd === "list"
 			? ["list", ...rest]
 			: cmd === "answer"
-				? answerArgs(Number(rest[0]), Number(rest[1]), coord.workers.find((w) => w.id === Number(rest[0]))?.fingerprint)
+				? answerArgs(Number(rest[0]), Number(rest[1]), coord.workers.find((w) => w.id === Number(rest[0]) && !w.registry)?.fingerprint)
 				: [cmd, rest[0]!];
 	const r = await routr($, argv);
 	if (r.missing) return $.ui.log("routr not found: put it on PATH or set ROUTR_BIN");
@@ -561,6 +635,7 @@ export const register: Register = (on) => {
 		const command = e.command;
 		if (!/routr|ROUTR_BIN/.test(command)) return next(e);
 		engaged = true;
+		await locatePlaces($, places(command)); // the Coordinator's locate is synchronous
 		if (e.run_in_background === true) {
 			const r = await next(e);
 			const task = /\bID:\s*([A-Za-z0-9]+)/.exec(r.text ?? "")?.[1];
@@ -575,7 +650,10 @@ export const register: Register = (on) => {
 		try {
 			const r = await next(e);
 			if (r.deny !== undefined) c.shellAborted(e.tool_use_id);
-			else await saveClaims($, c.shellEnded(e.tool_use_id, command, r.text ?? "") ?? []);
+			else {
+				await locatePlaces($, places(command, r.text ?? ""));
+				await saveClaims($, c.shellEnded(e.tool_use_id, command, r.text ?? "") ?? []);
+			}
 			$.clock.after(200, () => void poll($));
 			return r;
 		} catch (err) {

@@ -24,6 +24,7 @@ import (
 
 	"github.com/bcherb2/herdr-routr/internal/config"
 	"github.com/bcherb2/herdr-routr/internal/flow"
+	"github.com/bcherb2/herdr-routr/internal/herdr"
 	"github.com/bcherb2/herdr-routr/internal/registry"
 	"github.com/bcherb2/herdr-routr/internal/route"
 	"github.com/bcherb2/herdr-routr/internal/watch"
@@ -40,6 +41,7 @@ type cli struct {
 	env     map[string]string
 	spawned atomic.Int32
 	reach   error            // what connecting to herdr gives
+	server  herdr.Server     // what herdr's ping answers when it connects
 	unready map[string]error // harness → why it can't run workers
 	build   buildInfo        // what the binary says it was built from
 }
@@ -47,7 +49,8 @@ type cli struct {
 func newCLI(t *testing.T) *cli {
 	t.Helper()
 	dir := t.TempDir()
-	c := &cli{t: t, fake: &watchtest.Fake{}, dir: dir, p: registry.Paths{Dir: filepath.Join(dir, ".routr")}}
+	c := &cli{t: t, fake: &watchtest.Fake{}, dir: dir, p: registry.Paths{Dir: filepath.Join(dir, ".routr")},
+		server: herdr.Server{Version: "0.9.5", Protocol: herdr.Protocol}}
 	c.env = map[string]string{
 		"ROUTR_STATE_DIR":        c.p.Dir,
 		"HERDR_SOCKET_PATH":      "/tmp/fake-herdr.sock",
@@ -66,6 +69,7 @@ func (c *cli) app(stdin string, stdout, stderr *bytes.Buffer) *app {
 		getenv: func(k string) string { return c.env[k] }, cwd: c.dir, bin: "/usr/local/bin/routr", build: c.build,
 		dial:  func(string) worker.Driver { return c.fake },
 		reach: func(context.Context, string) error { return c.reach },
+		ping:  func(context.Context, string) (herdr.Server, error) { return c.server, c.reach },
 		spawn: func(registry.Paths) error { c.spawned.Add(1); return nil },
 		ready: func(_ context.Context, h string) error { return c.unready[h] },
 		now:   time.Now,
@@ -138,6 +142,10 @@ func TestStartPrintsTheIDAlone(t *testing.T) {
 	}
 	if !strings.Contains(errOut, "queued worker 1 red-team-plan-md · codex") {
 		t.Errorf("stderr = %q", errOut)
+	}
+	// the registry it is in, last on the line: a front end polls it for a worker queued from another repo
+	if !strings.HasSuffix(errOut, "; registry "+c.p.Dir+"\n") {
+		t.Errorf("stderr does not name the registry: %q", errOut)
 	}
 	w := c.worker(1)
 	if w.Harness != "codex" || w.Effort != "high" || w.Write || !w.WantVerdict || w.Preamble == "" || w.State != registry.Pending ||
@@ -385,9 +393,12 @@ func TestSendWaitAndPipeToWait(t *testing.T) {
 		c.until("the follow-up prompt", func() bool { return len(c.fake.Prompts(1)) == 2 })
 		c.fake.Finish(1, "pong")
 	}()
-	out := c.mustRun("", "send", "--wait", id, "ping")
-	if !strings.Contains(out, "pong") {
-		t.Errorf("send --wait: %q", out)
+	code, out, errOut := c.run("", "send", "--wait", id, "ping")
+	if code != 0 || !strings.Contains(out, "pong") {
+		t.Errorf("send --wait: %d %q %q", code, out, errOut)
+	}
+	if !strings.Contains(errOut, "routr: queued follow-up 1 for 1 ") || !strings.Contains(errOut, "; registry "+c.p.Dir+"\n") {
+		t.Errorf("send does not name the registry: %q", errOut)
 	}
 }
 
@@ -1943,6 +1954,7 @@ func TestEveryCommandHonorsJSON(t *testing.T) {
 	run(0, "flow", "show", "research")
 	run(0, "flow", "start", "plan-redteam", "--task", "x")
 	run(0, "watch")
+	run(0, "setup", "--dry-run", "--bin-dir", filepath.Join(c.dir, "bin"))
 	run(0, "doctor")
 	run(0, "version")
 	for name := range commands {
@@ -1956,7 +1968,7 @@ func TestDoctor(t *testing.T) {
 	c := newCLI(t)
 	squeeze := func(s string) string { return strings.Join(strings.Fields(s), " ") }
 	out := squeeze(c.mustRun("", "doctor"))
-	for _, want := range []string{"OK herdr reachable at /tmp/fake-herdr.sock", "OK watcher not running", "OK codex installed", "OK caller claude sess-main"} {
+	for _, want := range []string{"OK herdr reachable at /tmp/fake-herdr.sock: herdr 0.9.5, protocol 22", "OK watcher not running", "OK codex installed", "OK caller claude sess-main"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("doctor lacks %q:\n%s", want, out)
 		}
@@ -1995,12 +2007,140 @@ func TestDoctor(t *testing.T) {
 	}
 }
 
+// doctor reads herdr's protocol from its ping: an older one fails with the
+// release to update to, a newer one warns.
+func TestDoctorHerdrProtocol(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		server herdr.Server
+		reach  error
+		code   int
+		want   string
+	}{
+		{"current", herdr.Server{Version: "0.9.5", Protocol: herdr.Protocol}, nil, 0, "OK herdr reachable at /tmp/fake-herdr.sock: herdr 0.9.5, protocol 22"},
+		{"older", herdr.Server{Version: "0.8.2", Protocol: 20}, nil, exitError,
+			"FAIL herdr herdr 0.8.2 at /tmp/fake-herdr.sock speaks protocol 20; routr needs protocol 22, herdr " + herdr.MinVersion + " or later → run herdr update --handoff"},
+		{"newer", herdr.Server{Version: "1.0.0", Protocol: 23}, nil, 0,
+			"WARN herdr herdr 1.0.0 at /tmp/fake-herdr.sock speaks protocol 23, newer than the 22 routr is written against"},
+		{"not herdr", herdr.Server{}, &herdr.APIError{Method: "ping", Code: "unknown_method", Message: "no"}, exitError,
+			"FAIL herdr /tmp/fake-herdr.sock did not answer ping as herdr does"},
+		{"down", herdr.Server{}, &net.OpError{Op: "dial", Net: "unix", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}, exitError,
+			"FAIL herdr cannot reach /tmp/fake-herdr.sock"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newCLI(t)
+			c.server, c.reach = tc.server, tc.reach
+			code, out, _ := c.run("", "doctor")
+			if out = strings.Join(strings.Fields(out), " "); code != tc.code || !strings.Contains(out, tc.want) {
+				t.Errorf("exit %d, want %d; doctor lacks %q:\n%s", code, tc.code, tc.want, out)
+			}
+		})
+	}
+}
+
 // doctor in a directory routr has not been used in leaves it as it was.
 func TestDoctorCreatesNothing(t *testing.T) {
 	c := newCLI(t)
 	out := c.mustRun("", "doctor")
 	if _, err := os.Stat(c.p.Dir); !os.IsNotExist(err) || !strings.Contains(out, "routr start creates it") {
 		t.Errorf("stat %s: %v\n%s", c.p.Dir, err, out)
+	}
+}
+
+// doctor checks Pi's settings for what makes a long main-agent run re-send
+// its conversation uncached, reading only, and only where Pi's agent
+// directory exists.
+func TestDoctorChecksPiSettings(t *testing.T) {
+	squeeze := func(s string) string { return strings.Join(strings.Fields(s), " ") }
+	write := func(path, text string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const (
+		perTurn  = "WARN pi memory pi-memory inserts its recall before your latest message on every request, so each message you type re-sends the whole conversation to the model uncached → set \"memory\": {\"perTurnInjection\": false} in "
+		once     = "OK pi memory pi-memory adds its memory once, at session start"
+		short    = "WARN pi cache PI_CACHE_RETENTION=short: Anthropic models keep the cached conversation for 5 minutes; a turn after a longer gap (common overnight) re-sends all of it uncached → unset PI_CACHE_RETENTION where you start Pi; routr's extension then asks for an hour (a cache write costs 2x instead of 1.25x)"
+		long     = "OK pi cache routr's Pi extension asks Anthropic models to keep the main agent's cached conversation for an hour"
+		memories = `"packages": ["npm:pi-subagents", "npm:@samfp/pi-memory"]`
+	)
+	for _, tc := range []struct {
+		name            string
+		agentDir        bool   // PI_CODING_AGENT_DIR set, to a directory apart from ~/.pi/agent
+		global, project string // the agent directory's settings.json and the project's .pi/settings.json; "" = none
+		home            string // ~/.pi/agent/settings.json when PI_CODING_AGENT_DIR is set
+		retention       string
+		want, lacks     []string
+	}{
+		{name: "no pi-memory", global: `{"packages": ["npm:pi-subagents"]}`, want: []string{long}, lacks: []string{"pi memory"}},
+		{name: "no settings, cache set off", retention: "short", want: []string{short}, lacks: []string{"pi memory"}},
+		{name: "per turn by default", global: `{` + memories + `}`, want: []string{perTurn + "{home}/.pi/agent/settings.json (it then adds its memory once"}},
+		{name: "once", global: `{` + memories + `, "memory": {"perTurnInjection": false}}`, retention: "long", want: []string{once, long}, lacks: []string{"WARN pi"}},
+		{name: "a string is no boolean", global: `{` + memories + `, "memory": {"perTurnInjection": "false"}}`, want: []string{perTurn}},
+		{name: "the project turns it on", global: `{` + memories + `, "memory": {"perTurnInjection": false}}`, project: `{"memory": {"perTurnInjection": true}}`,
+			want: []string{perTurn + "{root}/.pi/settings.json"}},
+		{name: "the project's pi-memory block", project: `{` + memories + `, "pi-memory": {"perTurnInjection": false}}`, want: []string{once}},
+		{name: "memory wins over pi-memory", project: `{` + memories + `, "memory": {}, "pi-memory": {"perTurnInjection": false}}`, want: []string{perTurn}},
+		{name: "a package object", global: `{"packages": [{"source": "npm:@samfp/pi-memory", "extensions": []}]}`, want: []string{perTurn}},
+		{name: "pi-memory reads ~/.pi/agent", agentDir: true, global: `{` + memories + `, "memory": {"perTurnInjection": false}}`,
+			want: []string{perTurn + "{home}/.pi/agent/settings.json"}},
+		{name: "pi-memory reads ~/.pi/agent, set there", agentDir: true, global: `{` + memories + `}`, home: `{"memory": {"perTurnInjection": false}}`, want: []string{once}},
+		{name: "unparsable", global: `{"packages": [`, want: []string{"WARN pi memory {home}/.pi/agent/settings.json: unexpected end of JSON input → fix the file", long}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newCLI(t)
+			home := filepath.Join(c.dir, "home")
+			c.env["HOME"] = home
+			dir := filepath.Join(home, ".pi", "agent")
+			if tc.agentDir {
+				dir = filepath.Join(c.dir, "pi-agent")
+				c.env["PI_CODING_AGENT_DIR"] = dir
+				if tc.home != "" {
+					write(filepath.Join(home, ".pi", "agent", "settings.json"), tc.home)
+				}
+			}
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if tc.global != "" {
+				write(filepath.Join(dir, "settings.json"), tc.global)
+			}
+			if tc.project != "" {
+				write(filepath.Join(c.dir, ".pi", "settings.json"), tc.project)
+			}
+			if tc.retention != "" {
+				c.env["PI_CACHE_RETENTION"] = tc.retention
+			}
+			out := squeeze(c.mustRun("", "doctor"))
+			expand := strings.NewReplacer("{home}", home, "{root}", c.dir).Replace
+			for _, want := range tc.want {
+				if !strings.Contains(out, expand(want)) {
+					t.Errorf("doctor lacks %q:\n%s", expand(want), out)
+				}
+			}
+			for _, lacks := range tc.lacks {
+				if strings.Contains(out, lacks) {
+					t.Errorf("doctor has %q:\n%s", lacks, out)
+				}
+			}
+		})
+	}
+}
+
+// Without Pi's agent directory doctor says nothing of Pi's settings.
+func TestDoctorSkipsPiWithoutItsAgentDir(t *testing.T) {
+	c := newCLI(t)
+	if out := c.mustRun("", "doctor"); strings.Contains(out, "pi memory") || strings.Contains(out, "pi cache") {
+		t.Errorf("doctor without HOME:\n%s", out)
+	}
+	c.env["HOME"] = filepath.Join(c.dir, "home")
+	c.env["PI_CODING_AGENT_DIR"] = filepath.Join(c.dir, "no-such-dir")
+	if out := c.mustRun("", "doctor"); strings.Contains(out, "pi memory") || strings.Contains(out, "pi cache") {
+		t.Errorf("doctor with no agent dir:\n%s", out)
 	}
 }
 
@@ -2363,7 +2503,7 @@ on_fail = { resume = "implement", brief = "The check failed; see {{check.output}
 		t.Errorf("flow show:\n%s", out)
 	}
 	code, out, errOut := c.run("", "flow", "start", "fix", "--param", "check=go test ./...")
-	if code != 0 || out != "fix-1\n" || !strings.Contains(errOut, "queued 2 check · run (sh) step check") {
+	if code != 0 || out != "fix-1\n" || !strings.Contains(errOut, "queued 2 check · run (sh) step check; registry "+c.p.Dir+"\n") {
 		t.Fatalf("flow start: %d %q %q", code, out, errOut)
 	}
 	w := c.worker(2)
@@ -2637,5 +2777,51 @@ func TestDoctorChecksTheBuild(t *testing.T) {
 	c.build = buildInfo{Revision: "0123456789abcdef0123456789abcdef01234567", Src: src}
 	if ch := build(); ch.Status != "warn" || !strings.Contains(ch.Detail, "cannot compare") {
 		t.Errorf("a revision the checkout lacks: %+v", ch)
+	}
+}
+
+// A review started on its own that failed halts nothing: nothing comes after
+// it. routr approve says so, and on a worker that passed it says a pass needs
+// no approve.
+func TestApproveAStandaloneFailOrAPass(t *testing.T) {
+	c := newCLI(t)
+	now := time.Now()
+	c.seed(
+		registry.Worker{Role: "review", Harness: "codex", State: registry.Done, Verdict: registry.Fail, WantVerdict: true, Finished: now},
+		registry.Worker{Role: "review", Harness: "codex", State: registry.Done, Verdict: registry.Pass, WantVerdict: true, Finished: now},
+	)
+	out := c.mustRun("", "approve", "1")
+	if !strings.Contains(out, "1 review · codex: nothing comes after it, so nothing waited on its fail") || strings.Contains(out, "chain") {
+		t.Errorf("approve 1: %q", out)
+	}
+	if w := c.worker(1); w.Verdict != registry.Fail || !w.GoOn || w.Halts() {
+		t.Errorf("after approve: %+v", w)
+	}
+	code, _, errOut := c.run("", "approve", "2")
+	if code != exitError || !strings.Contains(errOut, "nothing to approve in 2: 2 review · codex is done, verdict pass; a pass needs no routr approve") {
+		t.Errorf("approve 2: %d %q", code, errOut)
+	}
+}
+
+// A maybe_done worker whose last reply is empty: result and wait say it was
+// empty, not "below is its last reply", and name a question that went
+// unanswered.
+func TestMaybeDoneWithAnEmptyReply(t *testing.T) {
+	c := newCLI(t)
+	c.seed(
+		registry.Worker{Harness: "claude", State: registry.MaybeDone, Unanswered: "Bash: rm -rf build", Started: time.Now()},
+		registry.Worker{Harness: "claude", State: registry.MaybeDone, Started: time.Now()},
+	)
+	os.MkdirAll(c.p.RunDir(1), 0o755)
+	os.WriteFile(c.final(1), nil, 0o644)
+	os.MkdirAll(c.p.RunDir(2), 0o755)
+	os.WriteFile(c.final(2), []byte("I stopped here.\n"), 0o644)
+	out := c.mustRun("", "result", "1")
+	want := "maybe done: 1 task · claude went idle without running routr done, after a question it asked went unanswered (dismissed or refused in its tab: Bash: rm -rf build); its last reply was empty."
+	if !strings.HasPrefix(out, want) || strings.Contains(out, "below") {
+		t.Errorf("result 1:\n%s", out)
+	}
+	if out := c.mustRun("", "result", "2"); !strings.Contains(out, "routr done; below is its last reply.") || !strings.HasSuffix(out, "\n\nI stopped here.\n") {
+		t.Errorf("result 2:\n%s", out)
 	}
 }

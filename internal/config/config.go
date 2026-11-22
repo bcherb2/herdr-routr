@@ -46,6 +46,10 @@ type Config struct {
 	// StartMCPServers lets workers start the user's MCP servers and
 	// claude.ai connectors; false (built in) starts them with none.
 	StartMCPServers bool `toml:"start_mcp_servers"`
+
+	// Unknown lists the keys Load ignored, one "FILE: key, key" per file:
+	// a typo, or a key from a newer routr than this one.
+	Unknown []string `toml:"-"`
 }
 
 // Questions is who answers a worker's question (a permission prompt, a
@@ -103,13 +107,19 @@ func UserPath() string {
 }
 
 // Load merges the built-in roles, then each existing file in paths (user
-// first, then repo). A missing file is skipped; an unknown key is an error
-// that names the file and key.
+// first, then repo). A missing file is skipped. An unknown key is ignored
+// and listed in Config.Unknown, not an error: one config serves every routr
+// on the machine, and an older one must still run when a newer one added a
+// key.
 func Load(paths ...string) (Config, error) {
-	merged, err := layer("built-in roles", builtin)
+	merged, unknown, err := layer("built-in roles", builtin)
 	if err != nil {
 		return Config{}, err
 	}
+	if unknown != nil {
+		return Config{}, fmt.Errorf("built-in roles: unknown keys: %s", strings.Join(unknown, ", "))
+	}
+	var ignored []string
 	for _, p := range paths {
 		if p == "" {
 			continue
@@ -121,9 +131,12 @@ func Load(paths ...string) (Config, error) {
 		if err != nil {
 			return Config{}, err
 		}
-		m, err := layer(p, string(b))
+		m, unknown, err := layer(p, string(b))
 		if err != nil {
 			return Config{}, err
+		}
+		if unknown != nil {
+			ignored = append(ignored, p+": "+strings.Join(unknown, ", "))
 		}
 		merge(merged, m)
 	}
@@ -132,26 +145,32 @@ func Load(paths ...string) (Config, error) {
 		return Config{}, err
 	}
 	c.Env = expandEnv(c.Env)
+	c.Unknown = ignored
 	return c, c.validate()
 }
 
-// layer parses one file, checking its keys against Config.
-func layer(name, text string) (map[string]any, error) {
+// layer parses one file, and names the keys in it that Config has no field
+// for. They stay in the map it returns; remarshal, decoding the merge into
+// Config, drops them.
+func layer(name, text string) (map[string]any, []string, error) {
 	var c Config
 	md, err := toml.Decode(text, &c)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", name, err)
+		return nil, nil, fmt.Errorf("%s: %w", name, err)
 	}
-	if bad := md.Undecoded(); len(bad) > 0 {
-		keys := make([]string, len(bad))
-		for i, k := range bad {
-			keys[i] = k.String()
+	var unknown []string
+	for _, k := range md.Undecoded() {
+		// a table's keys after the table itself: the table names them
+		if n := len(unknown); n > 0 && strings.HasPrefix(k.String(), unknown[n-1]+".") {
+			continue
 		}
-		return nil, fmt.Errorf("%s: unknown keys: %s", name, strings.Join(keys, ", "))
+		unknown = append(unknown, k.String())
 	}
 	m := map[string]any{}
-	_, err = toml.Decode(text, &m)
-	return m, err
+	if _, err = toml.Decode(text, &m); err != nil {
+		return nil, nil, fmt.Errorf("%s: %w", name, err)
+	}
+	return m, unknown, nil
 }
 
 // merge lays src over dst: tables merge key by key, anything else replaces.

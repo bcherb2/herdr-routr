@@ -81,17 +81,19 @@ Windows is not currently supported.
 
 ```sh
 git clone https://github.com/bcherb2/herdr-routr && cd herdr-routr
-./install.sh            # build, install, register the Claude Code plugin and Pi extension, link the skill for Codex
+./install.sh            # build, then routr setup: config, and the commands that add each front end
 ./install.sh --update   # git pull first; --test runs the tests first
 routr doctor            # from a herdr pane: checks herdr, harnesses, config
 ```
 
 `install.sh` puts the binary in `$BIN_DIR`, else `go env GOBIN`, else
-`$(go env GOPATH)/bin`; that directory must be on your `PATH`. For the
-harnesses it finds, it registers the Claude Code plugin
-([frontend/README.md](frontend/README.md)) and the Pi extension, which both
-ship the routr skill, and links the skill into `~/.codex/skills`. All of them
-are read from the clone, so keep it where it is.
+`$(go env GOPATH)/bin`; that directory must be on your `PATH`. It then runs
+`routr setup`, which writes the user config, restarts idle watchers on the
+old binary, and, for the harnesses it finds, prints the command that adds the
+Claude Code plugin ([frontend/README.md](frontend/README.md)), the Pi
+extension (both ship the routr skill) or the skill link for Codex. Neither
+installs nor registers anything outside routr: run the commands you want. The
+front ends are read from the clone, so keep it where it is.
 
 `routr doctor` prints one line per check, each problem with what to do about
 it, and exits 1 if a check fails.
@@ -103,7 +105,7 @@ so no command runs past its `--timeout`.
 - **Config:** `~/.config/routr/config.toml` sets roles, harness defaults,
   `[env]` for worker tabs, how the main agent keeps its context small
   (`[main]`) and where a model's work goes when it runs out (`[[fallback]]`).
-  `install.sh` writes it the first time with every key commented out and
+  `routr setup` writes it the first time with every key commented out and
   explained (`routr config init`). A repo's `.routr/config.toml` overrides
   it; `routr roles` shows the result.
 

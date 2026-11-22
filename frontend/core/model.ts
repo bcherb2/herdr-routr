@@ -47,6 +47,12 @@ export const FINISHED: ReadonlySet<State> = new Set<State>(["done", "maybe_done"
 
 export interface Worker {
 	id: number;
+	/**
+	 * the .routr directory of another repo's registry it was listed from: the
+	 * model queued it there (`cd ../other && routr start …`). Ids are per
+	 * registry. Absent for the session's own registry. The Coordinator sets it.
+	 */
+	registry?: string;
 	chain?: string;
 	step?: string;
 	role: string;
@@ -72,6 +78,8 @@ export interface Worker {
 	answerer?: string;
 	/** jev: who Jev handed the question it is blocked on to (the fallback, human or agent); absent while Jev decides */
 	handedTo?: string;
+	/** maybe_done: the question it was blocked on when it went idle with no answer through routr (dismissed or refused in its tab) */
+	unanswered?: string;
 	/** why it waits or how it got here; for a question Jev handed over, Jev's pick and confidence */
 	note?: string;
 	error?: string;
@@ -164,6 +172,7 @@ function toWorker(v: unknown): Worker | undefined {
 		asksAbout: obj(r.pending) ? str(r.pending.summary) : undefined,
 		answerer: str(r.answerer),
 		handedTo: str(r.handed_to),
+		unanswered: str(r.unanswered),
 		note: str(r.note),
 		error: str(r.error),
 		output: str(r.output),
@@ -188,6 +197,45 @@ function toWorker(v: unknown): Worker | undefined {
 		started: parseTime(r.started),
 		finished: parseTime(r.finished),
 	};
+}
+
+/** A worker id or chain name in a registry: bare in the session's own (undefined), else with the registry, as ids are per registry. */
+export function refKey(registry: string | undefined, ref: number | string): string {
+	return registry ? `${registry}#${ref}` : String(ref);
+}
+
+/** What tells a worker from every other the front end lists: its id, and its registry if it is another repo's. */
+export function workerKey(w: Pick<Worker, "id" | "registry">): string {
+	return refKey(w.registry, w.id);
+}
+
+/** The repo a registry is in, by its directory's name: "vp9enc-rs" for /code/vp9enc-rs/.routr. */
+export function repoName(registry: string): string {
+	const parts = registry.split("/").filter(Boolean);
+	const last = parts.at(-1) ?? registry;
+	return last === ".routr" ? (parts.at(-2) ?? last) : last;
+}
+
+/** A word as the shell reads it back: quoted when it has to be. */
+function shellWord(s: string): string {
+	return /^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * What goes before `routr` in a command about w: nothing for a worker of the
+ * session's own registry; for another repo's, `cd ROOT && `, or
+ * `ROUTR_STATE_DIR=DIR ` when its registry is not ROOT/.routr.
+ */
+export function routrIn(w: Pick<Worker, "registry">): string {
+	if (!w.registry) return "";
+	const r = w.registry.replace(/\/+$/, "");
+	if (r.endsWith("/.routr")) return `cd ${shellWord(r.slice(0, -"/.routr".length) || "/")} && `;
+	return `ROUTR_STATE_DIR=${shellWord(r)} `;
+}
+
+/** " @vp9enc-rs" after the name of another repo's worker; "" for the session's own. */
+export function repoTag(w: Pick<Worker, "registry">): string {
+	return w.registry ? ` @${repoName(w.registry)}` : "";
 }
 
 /** Parse `routr list --json` stdout: an array, or a single object. */
@@ -323,10 +371,10 @@ export function note(w: Worker, answerHint: string): string | undefined {
 	switch (w.state) {
 		case "blocked":
 			if (jevDecides(w)) return "Jev decides its question";
-			// the about part is clipped so the key stays on screen
-			return `⚠ ${w.harness} ${w.id} ${asks(w)} · ${answerHint}`;
+			// the about part is clipped so the key stays on screen; the picker answers the session's own registry only
+			return `⚠ ${w.harness} ${w.id} ${asks(w)} · ${w.registry ? "answer in its tab" : answerHint}`;
 		case "gated":
-			return `waits at a gate → /routr approve ${w.id} to start it`;
+			return w.registry ? `waits at a gate → routr approve ${w.id} in ${repoName(w.registry)} starts it` : `waits at a gate → /routr approve ${w.id} to start it`;
 		case "needs_you":
 			return `needs you: ${w.error ?? "the chain cannot go on alone"}`;
 		case "failed":
@@ -347,8 +395,8 @@ export interface CardOptions {
 	mine: (w: Worker) => boolean;
 	/** how the user answers a question, at the end of its note (Pi: "alt+q answer") */
 	answerHint: string;
-	/** recent activity lines per worker id */
-	activity?: ReadonlyMap<number, readonly string[]>;
+	/** recent activity lines per worker (workerKey) */
+	activity?: ReadonlyMap<string, readonly string[]>;
 	maxActivity?: number;
 }
 
@@ -367,10 +415,10 @@ export function toCards(workers: readonly Worker[], o: CardOptions): Card[] {
 		.sort((a, b) => rank(a) - rank(b) || a.id - b.id)
 		.map((w) => {
 			const chain = w.chain ? ` [${[w.chain, w.step].filter(Boolean).join("/")}]` : "";
-			const acts = ACTIVE.has(w.state) || w.state === "blocked" ? (o.activity?.get(w.id) ?? []) : [];
+			const acts = ACTIVE.has(w.state) || w.state === "blocked" ? (o.activity?.get(workerKey(w)) ?? []) : [];
 			return {
 				id: w.id,
-				title: `${w.id} ${w.title ?? w.role}${chain}`,
+				title: `${w.id} ${w.title ?? w.role}${chain}${repoTag(w)}`,
 				engine: engine(w),
 				state: w.state,
 				age: age(w, o.now),

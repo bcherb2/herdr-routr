@@ -52,6 +52,14 @@ Before a plan, write DECISIONS.md (decisions, constraints, open questions) and
 pass `--in DECISIONS.md`. Never paste the whole chat. routr adds the role's
 preamble and tells the worker to finish with `routr done`.
 
+routr already takes turns between writers in one tree: a worker of a write
+role (task, plan, implement) starts only once no other writer holds that tree's
+directory lock, and shows `waiting` with a note naming the one it waits on
+until then. Read-only roles (review, research) run beside them. So start
+writers together and leave the brief without a guard such as "wait until
+`routr list` shows nothing else running". Writers that should work at once
+need their own worktrees (flows.md, "Worktrees").
+
 ## Commands
 
 How you get a worker's result depends on your harness:
@@ -193,7 +201,9 @@ stops the steps after it (they wait for you; `wait` exits 4). As the last
 step, the fail is the chain's answer: `wait` exits 0 with `verdict: fail`. In a flow, `judge = "jev"` asks Jev a
 closed question about the steps before it: pass/fail, or `pick = true` for
 the best of them (flows.md, "Judge steps"). Any step's fail verdict without `on_fail`
-halts the steps after it until `routr approve`; a step whose findings are
+halts the steps after it until `routr approve`. A worker started on its own
+(a review with no chain) halts nothing, and a pass never needs approving:
+tell the user the result, with no `routr approve`. A step whose findings are
 the work, not a no, should not be asked for a verdict (role `hunt`).
 A step that only writes into `{{work}}` (plans, notes): `write = false`, so
 it does not take the repo's lock. Named flows cover the common shapes:

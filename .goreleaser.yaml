@@ -1,0 +1,37 @@
+# Release binaries for the herdr plugin's build step (scripts/plugin-build.sh).
+# The asset names are its contract: routr_<version>_<os>_<arch>.tar.gz, with
+# the routr binary at the archive root, and checksums.txt. <version> has no
+# leading v; the tag is v<version>.
+#
+# routr has no version variable to stamp: `routr version` reads the commit
+# from the VCS fields go build embeds, which this build keeps.
+version: 2
+
+project_name: routr
+
+builds:
+  - main: ./cmd/routr
+    binary: routr
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags: [-s -w]
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files: [LICENSE, README.md]
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot"
+
+release:
+  github:
+    owner: bcherb2
+    name: herdr-routr

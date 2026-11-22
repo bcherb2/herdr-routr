@@ -162,28 +162,64 @@ With the extension loaded you don't need the `/routr` prompt template in
 | `ROUTR_MAIN_AT` | `150000` | cut once a run ends past this many tokens; overrides `[main] at`. `-1`: only Pi's own compaction near the model's window |
 | `ROUTR_MAIN_KEEP_TURNS` | `3` | the last turns a `truncate` keeps as they were; overrides `[main] keep_turns`. `-1`: no limit |
 | `ROUTR_MAIN_KEEP_TOKENS` | `40000` | at most this many tokens of those turns, below `at`; overrides `[main] keep_tokens`. `-1`: no limit |
+| `ROUTR_MAIN_KEEP_HEAD` | on | `0`: a `truncate` keeps no first turn, and the note quotes your first message instead; overrides `[main] keep_head` |
+| `ROUTR_MAIN_HEAD_TOKENS` | `40000` | at most this many tokens of the first turn a `truncate` keeps; overrides `[main] head_tokens`. `-1`: no limit |
 | `ROUTR_MAIN_STRIP_REASONING` | on | `0`: keep earlier turns' reasoning in the main agent's requests; overrides config `[main] strip_reasoning`, which the extension reads with `routr main --json` at session start (a routr too old for that command: the built-in `[main]` with the `ROUTR_MAIN_*` variables). By default each request drops the reasoning of every turn before the latest incoming message (yours, or a routr wake): Pi resends it otherwise, and a provider such as DeepSeek bills it as input on every later turn. Only for Chat Completions models (`api: openai-completions`: DeepSeek, OpenRouter, z.ai); the Responses APIs pair earlier tool calls with their reasoning, and Anthropic already ignores it. Each turn is resent once without its reasoning, uncached, when the next message arrives. The session file keeps it. Workers (`ROUTR_ID` set) are never changed |
 | `ROUTR_STATE_DIR` | from git | the `.routr` directory, as for the CLI |
+| `PI_CACHE_RETENTION` | `long` | Pi's own: how long the provider keeps the cached conversation. The extension sets `long` for the main agent when it is unset (an hour on Anthropic models, OpenRouter's too, rather than 5 minutes): the main agent waits on its workers, often longer than 5 minutes, and a turn after the cache expired re-sends the whole conversation uncached. A cache write then costs 2x the input price instead of 1.25x. `short`: Pi's 5 minutes. Workers (`ROUTR_ID` set) keep Pi's default |
 
 ## The main agent's context
 
 On a long run the main agent's context is cut as config `[main]` says
 (skills/routr/cli.md, "[main]"; `routr main` prints it). The default:
 once a run ends past 150000 tokens, the extension truncates it before
-the next turn, with no model call. A note stands in for the earlier
-conversation: your first message word for word, what you wrote since,
-the latest `todo` list, this session's workers from a fresh `routr list`,
-and where state lives. The last 3 turns, at most 40000 tokens of them,
-follow as they were. Wakes wait until the cut is done, since a turn
+the next turn, with no model call. The session's first turn stays as it
+was (`keep_head`): your first message and everything the model read and
+did for it. A note follows in place of the rest of the earlier
+conversation: what you wrote since, the latest `todo` list, this
+session's workers from a fresh `routr list`, and where state lives. The
+last 3 turns, at most 40000 tokens of them, follow as they were. Wakes wait until the cut is done, since a turn
 started meanwhile would be aborted by it. Pi's own compaction near the
 model's window is answered the same way; your `/compact` is still Pi's
 summary. `summarize` hands the cut to Pi's summary with instructions to
 keep worker and bead IDs. A worker's context is never touched. The
 session file keeps everything.
 
+The first turn is taken at the first cut and kept the same at every
+later one, whatever `[main]` says by then (a cut for a smaller window,
+below, and one held under `at` aside), so it stays cached: on Anthropic models (OpenRouter's
+too) the extension adds a cache breakpoint at its end, and each cut
+writes only the note and the turns after it. A request that has the
+four breakpoints Anthropic allows already gets none (an OAuth login:
+Pi marks four itself), so there each cut writes the first turn to the
+cache again. Over `head_tokens` (40000) the first turn is shrunk: first
+the model's thinking where the API allows (Anthropic, Chat Completions; not the Responses APIs,
+which pair tool calls with their reasoning), then the largest tool
+results, each replaced by a line telling the model to re-read it. Your
+message, the model's text and its tool calls are never changed. A first
+turn that still won't fit is dropped, and the note quotes your first
+message instead, as with `keep_head = false`.
+
+`keep_tokens` and `head_tokens` count in Pi's estimate, a token per 4
+characters, and an orchestrator's tool calls, logs and JSON often take
+nearer twice that. Kept as `[main]` says, such a cut can leave the
+request still past `at`, and each turn is cut again, the cache rewritten
+every time. So a cut is also held to what leaves the request, the system
+prompt included, at 70% of `at` as the provider counts it: the extension
+scales by how far the last request's own count was over Pi's estimate of
+it, and when `[main]`'s cut would come out bigger it keeps fewer turns,
+then shrinks the first turn or drops it, as for a smaller window (below).
+The first turn shrunk is the one later cuts keep. A cut that still left
+the request past `at` is not tried again until the context has grown a
+tenth. If the first answer after a cut is still past 80% of `at`, the
+extension says so once: raise `at`, or lower `keep_tokens`. A lower `head_tokens` counts from a new session:
+this one's first turn is kept as it was taken.
+
 Pi compacts nothing shorter than its `compaction.keepRecentTokens` of
-conversation (20000 by default), so with a low `at` the extension says
-once that the cut has to wait.
+conversation since the last cut (20000 by default; the first turn kept
+in front of the note does not count), so the extension waits, quietly,
+until the conversation is past it. Should Pi refuse all the same, it
+says so once.
 
 ## When the main agent's model fails
 
@@ -195,7 +231,12 @@ first `pi:` entry Pi knows and has a key for, and carries on with a
 `[routr]` message naming the failure and the new model. A fallback that
 fails too moves on down the same rule's list. If the context would fill
 more than 80% of the new model's window, it is truncated first, to at
-most half of it. A model you switched to yourself is left alone. With no
+most half of it: the first turn, the note and the turns kept together.
+The first turn gets at most half of that, shrunk as over `head_tokens`;
+one that won't go that small, or leaves the rest too little room, is
+dropped, and the note quotes your first message instead. Later cuts
+keep it as this one left it. Pi's own compaction after a request
+overflows the window is held to the same half. A model you switched to yourself is left alone. With no
 rule, or the list spent, it tells you, and wakes wait for your next
 message instead of each failing the same way. Errors that may pass
 (overloaded, a timeout) are left to Pi's own retry. A worker never
@@ -211,8 +252,9 @@ mine, and is grouped with the others created in the same agent run.
 As a fallback, for workers without that record, and to know which workers
 the model waits on, the extension reads the model's own bash calls (Pi
 merges stderr into their output):
-- "routr: queued worker ID …", which `routr start` and `flow start` print on
-  stderr for every worker, also in pipes and in `id=$(routr start …)`;
+- "routr: queued worker ID …; registry DIR", which `routr start` and `flow
+  start` print on stderr for every worker, also in pipes and in
+  `id=$(routr start …)`;
 - the id that `routr start` prints, or its `--json` record;
 - the chain id from `routr flow start`;
 - the id in `routr send ID`;
@@ -222,6 +264,19 @@ The rest of a chain is found through the worker's `chain` field. The claims
 are saved in the session (`appendEntry`), so `pi -r` keeps them. Results the
 model already read with `routr wait`, `--wait` or `routr result` don't wake
 it again.
+
+The model may queue workers in another repo's registry (`cd ../other &&
+routr start …`). Worker ids are per registry, so each claim records the
+registry it was made in: the one the "queued" line (or a `--json` record's
+`run_dir`) names, else where the command put the call (`cd DIR`, `--root`,
+`ROUTR_STATE_DIR=`), resolved by the CLI's rule. A call whose directory only
+the shell knows (`cd "$REPO"`) with no "queued" line to name it claims
+nothing, rather than an id in the wrong registry. The extension lists each
+other registry it holds claims in until none of its workers there is at
+work, and wakes for them as for its own. Their cards say `@repo`, and the
+wake tells the model to run their commands there (`cd /other && routr
+result 7`). alt+q and `/routr` act on the session's own registry, so
+another repo's question is answered in its tab, or by the model.
 
 The CLI detects Pi from `PI_CODING_AGENT`, which Pi sets for every command
 its model runs, or `PI_SESSION_ID`. It checks them before `CLAUDECODE=1`
@@ -246,12 +301,14 @@ All from the Pi package's `docs/extensions.md` and its type declarations (Pi 1.0
 | `pi.on("tool_execution_end")`, `pi.on("agent_end")` | a wait that ended without a result covers nothing any more |
 | `pi.on("before_agent_start")` → `systemPromptOptions.sections.routr` | a `<routr>` section, not a whole `systemPrompt`, so Pi records only its changes and keeps the cached prefix: "start workers without --wait; you'll be woken; leave out --permissions" (routr gives a Pi caller's workers `bypass`); while the binary is older than this checkout, "pass --permissions bypass, and tell the user to run install.sh" instead, since an old binary may not |
 | `pi.on("agent_start")` | group workers started in the same run |
-| `pi.on("context")` → `messages` | the main agent's requests without earlier turns' reasoning (`src/context.ts`); Pi passes a copy, so the session file is untouched |
+| `pi.on("context")` → `messages` | the main agent's requests with the kept first turn in front of the note (`keptHead` in `src/compaction.ts`, a copy from `ctx.sessionManager.getBranch()`), and without earlier turns' reasoning (`src/context.ts`); Pi passes a copy, so the session file is untouched |
+| `pi.on("before_provider_request")` → the payload | on `anthropic-messages`, a cache breakpoint at the end of the kept first turn (`markHeadEnd` in `src/context.ts`) |
+| `pi.on("message_end")` → the assistant message's `usage` | the context after a cut, still close to `[main] at`, said once |
 | `pi.on("agent_settled")`, `ctx.getContextUsage()`, `ctx.compact({customInstructions, onComplete, onError})` | past `[main] at` once the run has settled, compact; for `summarize`, with instructions naming the workers and the todo list |
 | `pi.on("session_before_compact")` → `{compaction: {summary, firstKeptEntryId, tokensBefore, details}}` | `truncate`: answer our compaction and Pi's threshold and overflow ones with the note and the last turns (`src/compaction.ts`, using Pi's `buildSessionProjection` and `estimateTokens`); the user's `/compact` (`reason: "manual"`, not ours) is left to Pi |
 | `pi.on("session_compact" / "session_compact_failed")` | the cut is over: wakes held for it go |
 | `pi.on("agent_end")` → the last assistant message's `stopReason: "error"` and `errorMessage`; `ctx.modelRegistry.find` / `hasConfiguredAuth`; `pi.setModel`, `pi.setThinkingLevel` | the model fallback: the next usable `[[fallback]]` model, then a `routr-fallback` message with `triggerTurn` |
-| `pi.getSettings().compaction.keepRecentTokens` | why Pi refused a cut ("Nothing to compact"), said once |
+| `pi.getSettings().compaction.keepRecentTokens` (and its `modelOverrides`) | no cut while Pi's `prepareCompaction` would refuse it (`piCompacts` in `src/compaction.ts`, its rule); why Pi refused one ("Nothing to compact"), said once |
 | `pi.sendMessage({customType, content, display, details}, {triggerTurn: true, deliverAs})` | wake the model: `steer` when a worker needs a person, `followUp` otherwise ("pi.sendMessage") |
 | `pi.registerMessageRenderer("routr-wake")` | the wake as a compact card; expand for the full text ("Message and Entry Rendering") |
 | `ctx.ui.setWidget(key, factory)`, `ctx.ui.setStatus` | the steps or cards and the footer count ("Widgets, Status, and Footer"; docs/tui.md, Pattern 5) |

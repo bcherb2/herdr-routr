@@ -41,7 +41,7 @@ test("a chain: one row per step, foreach copies folded into ×N", () => {
 
 test("the running worker of a single-worker step shows its latest tool call", () => {
 	const ws = chain.map((w): Worker => (w.id === 10 ? { ...w, state: "running", started: T0 + 9 * MIN } : w));
-	const lines = stepLines(toSteps(ws, opts({ activity: new Map([[10, ["Read a.go", "Edit b.go"]]]) })), plain);
+	const lines = stepLines(toSteps(ws, opts({ activity: new Map([["10", ["Read a.go", "Edit b.go"]]]) })), plain);
 	assert.deepEqual(lines.slice(-2), ["  ▶ merge         claude · 1m00s", "      ⎿ Edit b.go"]);
 });
 
@@ -117,4 +117,20 @@ test("a theme's escape codes around an empty field leave no stray separator", ()
 	const strip = (s: string) => s.replace(/\x1b\[\d+m/g, "");
 	const merge = stepLines(toSteps(chain, opts()), ansi).map(strip).find((l) => l.includes("merge"));
 	assert.equal(merge, "  ⏸ merge         claude");
+});
+
+test("another repo's chain and workers: their own blocks and rows, tagged with the repo", () => {
+	const reg = "/code/vp9enc-rs/.routr";
+	const at = (x: Partial<Worker>): Worker => ({ id: 1, role: "task", harness: "claude", state: "running", created: T0, started: T0, ...x });
+	const ws = [
+		at({ id: 1, chain: "plan-1", step: "plan" }),
+		at({ id: 1, chain: "plan-1", step: "plan", registry: reg }),
+		at({ id: 2, role: "research" }),
+		at({ id: 2, role: "research", registry: reg }),
+	];
+	const lines = stepLines(toSteps(ws, opts({ group: () => "run:1" })), plain);
+	assert.ok(lines.some((l) => l.includes("plan-1 @vp9enc-rs")), lines.join("\n"));
+	assert.ok(lines.some((l) => /^▶ plan-1 ·/.test(l)), lines.join("\n"));
+	assert.ok(lines.some((l) => l.includes("2 research @vp9enc-rs")), lines.join("\n"));
+	assert.ok(lines.some((l) => /2 research(?! @)/.test(l)), lines.join("\n"));
 });

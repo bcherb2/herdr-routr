@@ -68,7 +68,7 @@ test("an interactive worker's reply to a follow-up wakes once, and the next one 
 	assert.deepEqual(t.update([talk(1, 1)], ctx), [], "no repeat while it stays running");
 	assert.deepEqual(t.update([talk(2, 2)], ctx).map((i) => i.kind), ["reply"], "a reply whose turn we never saw in flight");
 	t.update([talk(3, 2)], ctx);
-	t.markSeen([1]); // routr send --wait returned it
+	t.markSeen(["1"]); // routr send --wait returned it
 	assert.deepEqual(t.update([talk(3, 3)], ctx), []);
 });
 
@@ -153,11 +153,11 @@ test("drop: the model cancelled it; its news is moot before the next snapshot sa
 	t.update([w(1, "running"), w(2, "running"), w(3, "running")], ctx);
 	t.update([w(1, "maybe_done"), w(2, "done", { finished: 2 }), w(3, "running")], ctx);
 	assert.deepEqual(t.pending().map((i) => i.worker.id), [1, 2]);
-	t.drop([1, 2]);
+	t.drop(["1", "2"]);
 	assert.deepEqual(t.pending().map((i) => i.worker.id), [2], "a done result stays: cancel leaves it done");
 	assert.deepEqual(t.update([w(1, "maybe_done"), w(2, "done", { finished: 2 }), w(3, "done")], ctx).map((i) => i.worker.id), [2, 3], "1 does not come back");
 	// a worker never seen: nothing to drop, nothing breaks
-	t.drop([99]);
+	t.drop(["99"]);
 	assert.deepEqual(t.pending(), []);
 });
 
@@ -256,7 +256,7 @@ test("a running routr wait holds the news it will return; what it didn't return 
 	assert.deepEqual(t.update([w(1, "done"), w(2, "done")], ctx).map((i) => i.worker.id), [2], "1 is held for the wait");
 	assert.deepEqual(t.update([w(1, "done"), w(2, "done")], ctx), []);
 	// the wait returned 1's result
-	t.markSeen([1]);
+	t.markSeen(["1"]);
 	covering = [];
 	assert.deepEqual(t.update([w(1, "done"), w(2, "done")], ctx), []);
 	assert.equal(t.pending().length, 0);
@@ -302,7 +302,7 @@ test("results the model already read are not woken for", () => {
 	const t = new WakeTracker();
 	const ctx = mineCtx([1]);
 	t.update([w(1, "running")], ctx);
-	t.markSeen([1]);
+	t.markSeen(["1"]);
 	assert.deepEqual(t.update([w(1, "done")], ctx), []);
 	// the suppression is used up
 	t.update([w(1, "running")], ctx);
@@ -318,9 +318,9 @@ test("wake message: result text, verdict, gate and question wording", () => {
 		{ worker: w(7, "running", { role: "plan", interactive: true, turn: 2, replies: 2 }), kind: "reply" as const },
 	];
 	const results = new Map([
-		[3, "Two findings.\n1. Token refresh races.\n\noutput: REDTEAM.md\nverdict: fail\n"],
-		[6, "x".repeat(5000)],
-		[7, "reply to follow-up 2:\nKeep the lock."],
+		["3", "Two findings.\n1. Token refresh races.\n\noutput: REDTEAM.md\nverdict: fail\n"],
+		["6", "x".repeat(5000)],
+		["7", "reply to follow-up 2:\nKeep the lock."],
 	]);
 	const m = buildWakeMessage(items, results, 4000);
 	assert.match(m.content, /^\[routr\] worker 3 · review · codex·gpt-6-astra·high is done, verdict fail\.\n\nTwo findings\./);
@@ -354,7 +354,7 @@ test("wake message: a failed worker's recovery command survives the clip", () =>
 		"failed: 1 task · claude: the harness exited before it ran routr done\n" +
 		"routr send 1 … resumes its session\n\n" +
 		"x".repeat(6000);
-	const m = buildWakeMessage([{ worker: w(1, "failed", { error: "the harness exited before it ran routr done" }), kind: "failed" }], new Map([[1, result]]), 4000);
+	const m = buildWakeMessage([{ worker: w(1, "failed", { error: "the harness exited before it ran routr done" }), kind: "failed" }], new Map([["1", result]]), 4000);
 	assert.match(m.content, /^\[routr\] worker 1 · task · codex failed: the harness exited before it ran routr done\.\n\nfailed: .*\nroutr send 1 … resumes its session\n/);
 	assert.match(m.content, /\(clipped; full text: routr result 1\)$/);
 });
@@ -383,9 +383,9 @@ test("wake message: who answers a blocked worker's question is routr's to say", 
 		"Tell the user what it asks. They answer in its tab (routr show 4), or tell you an option.",
 		"If they tell you option N, run: routr answer 4 N --by human --expect 6a128b4273b95faa",
 	];
-	const ctx = (extra: Partial<QuestionContext> = {}): ReadonlyMap<number, QuestionContext> =>
-		new Map([[4, { answer, lasting: [], question: "Do you want to proceed?\n1. Yes\n2. No", fingerprint: "6a128b4273b95faa", ...extra }]]);
-	const msg = (item = blocked(4), contexts: ReadonlyMap<number, QuestionContext> = new Map()) => buildWakeMessage([item], new Map(), undefined, contexts).content;
+	const ctx = (extra: Partial<QuestionContext> = {}): ReadonlyMap<string, QuestionContext> =>
+		new Map([["4", { answer, lasting: [], question: "Do you want to proceed?\n1. Yes\n2. No", fingerprint: "6a128b4273b95faa", ...extra }]]);
+	const msg = (item = blocked(4), contexts: ReadonlyMap<string, QuestionContext> = new Map()) => buildWakeMessage([item], new Map(), undefined, contexts).content;
 
 	assert.equal(msg(blocked(4), ctx()), [head(4), ...answer, "The user can also type `/routr answer 4 N` here."].join("\n"), "routr's lines, then the front end's way in");
 	assert.equal(msg(blocked(4), ctx({ fingerprint: undefined })), [head(4), ...answer].join("\n"), "no menu now: nothing to pick here");
@@ -420,7 +420,7 @@ test("a question Jev decides wakes the model only once Jev hands it over", () =>
 	// handed over: Jev's note leads routr's lines
 	const item = { worker: w(3, "blocked", { ...q, asksAbout: "Bash: rm -rf build", handedTo: "human", note }), kind: "blocked" as const };
 	const answer = [note, "The user answers this question, not you: do not choose an option yourself, even an obvious one."];
-	const ctxs = new Map([[3, { answer, lasting: [] }]]);
+	const ctxs = new Map([["3", { answer, lasting: [] }]]);
 	assert.equal(
 		buildWakeMessage([item], new Map(), undefined, ctxs).content,
 		["[routr] worker 3 · task · claude is blocked: Do you want to proceed?\n1. Yes\n2. No\nIt asks about Bash: rm -rf build", ...answer].join("\n"),
@@ -450,7 +450,71 @@ test("a delivery that failed is held again, until newer news or maxTries", () =>
 	assert.deepEqual(t.pending(), []);
 	// The model read the result (routr wait) while the delivery was in flight.
 	const read = t.update([w(1, "done", { finished: 6 }), w(2, "running")], ctx);
-	t.markSeen([1]);
+	t.markSeen(["1"]);
 	assert.deepEqual(t.requeue(read), { held: [], dropped: [] });
 	assert.deepEqual(t.update([w(1, "done", { finished: 6 }), w(2, "running")], ctx), []);
+});
+
+// Another repo's worker (the model queued it there): its commands run where its registry is.
+test("wake message: another repo's worker names its registry, and its commands cd there", () => {
+	const reg = "/code/vp9 enc/.routr";
+	const done = { worker: w(141, "done", { registry: reg }), kind: "done" as const };
+	const m = buildWakeMessage([done], new Map([[`${reg}#141`, "y".repeat(3000)]]), 1000);
+	assert.match(m.content, /^\[routr\] worker 141 · task · codex @vp9 enc is done\.\nIt is in another repo's registry \(\/code\/vp9 enc\/\.routr\): run routr commands about it as `cd '\/code\/vp9 enc' && routr …`\.\n\ny/);
+	assert.match(m.content, /full text: cd '\/code\/vp9 enc' && routr result 141\)$/);
+	assert.equal(m.details.entries[0]!.title, "141 task @vp9 enc");
+	assert.equal(buildWakeMessage([done], new Map([["141", "home's"]])).content.includes("home's"), false, "a result keyed by the bare id is home's worker's");
+	const gated = buildWakeMessage([{ worker: w(9, "gated", { registry: "/o/.routr" }), kind: "gated" }], new Map()).content;
+	assert.match(gated, /Run `cd \/o && routr approve 9` only after the user says yes/);
+	// a question: routr's lines, but not the picker's /routr answer, which answers at home
+	const q = { worker: w(4, "blocked", { registry: "/o/.routr", question: "Proceed?" }), kind: "blocked" as const };
+	const ctx = new Map([["/o/.routr#4", { answer: ["The user answers this question."], lasting: [], fingerprint: "f" }]]);
+	const text = buildWakeMessage([q], new Map(), undefined, ctx).content;
+	assert.match(text, /The user answers this question\./);
+	assert.doesNotMatch(text, /\/routr answer/);
+	assert.match(buildWakeMessage([q], new Map()).content, /Run `cd \/o && routr wait 4` before/);
+	// a registry not named .routr: ROUTR_STATE_DIR
+	assert.match(buildWakeMessage([{ worker: w(2, "closed", { registry: "/s/state" }), kind: "closed" }], new Map()).content, /`ROUTR_STATE_DIR=\/s\/state routr send 2 "…"` resumes/);
+});
+
+test("the tracker tells workers of two registries with one id apart, and baselines each registry's first list", () => {
+	const t = new WakeTracker();
+	const o = (id: number, state: State) => w(id, state, { registry: "/o/.routr" });
+	const ctx: WakeContext = { isMine: () => true, group: () => undefined, fresh: (x) => x.registry === "/o/.routr" && x.id === 2 };
+	t.update([w(1, "running")], ctx);
+	assert.deepEqual(t.update([o(1, "done"), o(2, "done")], ctx, { registry: "/o/.routr" }).map((i) => `${i.worker.registry}#${i.worker.id}`), ["/o/.routr#2"], "its first list: only what the session claimed since it began");
+	assert.deepEqual(t.update([w(1, "done")], ctx).map((i) => `${i.worker.registry ?? ""}#${i.worker.id}`), ["#1"], "home's 1 has news of its own");
+	t.markSeen(["/o/.routr#3"]);
+	t.update([w(1, "done")], ctx);
+	t.update([w(1, "done")], ctx);
+	t.update([w(1, "done")], ctx);
+	assert.deepEqual(t.update([o(3, "done")], ctx, { registry: "/o/.routr" }), [], "seen holds through home's lists: it counts its own registry's");
+});
+
+// Workers 143/144: reviews started on their own. routr marks their fail
+// `halts`, but nothing comes after them: nothing waits, nothing to approve.
+test("wake message: a fail with no chain says no step waits on it, and offers no approve", () => {
+	const review = w(143, "done", { role: "review", verdict: "fail", halts: true });
+	const text = buildWakeMessage([{ worker: review, kind: "done" }], new Map()).content;
+	assert.match(text, /^\[routr\] worker 143 · review · codex is done, verdict fail\.\nNo step waits on it: it was started on its own\. Tell the user why it failed \(below\); there is nothing to approve\.$/);
+	assert.doesNotMatch(text, /routr approve|steps after it/);
+	const pass = buildWakeMessage([{ worker: w(154, "done", { role: "review", verdict: "pass" }), kind: "done" }], new Map()).content;
+	assert.doesNotMatch(pass, /approve/, "a pass offers no approve");
+});
+
+// Worker 200: maybe_done after a dismissed question, final-1.md 0 bytes.
+test("wake message: maybe_done with an empty last reply says so, and names the question that went unanswered", () => {
+	const idle = w(200, "maybe_done", { unanswered: "Bash: rm -rf build", output: "OUT.md" });
+	const header = "maybe done: 200 task · codex went idle without running routr done; below is its last reply. routr send 200 … to have it go on (or run routr done)";
+	const msg = (result: string) => buildWakeMessage([{ worker: idle, kind: "maybe_done" }], new Map([["200", result]])).content;
+	// an older routr's result: its header, and nothing below it but the output line
+	const empty = msg(`${header}\n\noutput: OUT.md\n`);
+	assert.match(empty, /^\[routr\] worker 200 · task · codex went idle without running routr done, after a question it asked went unanswered \(dismissed or refused in its tab: Bash: rm -rf build\)\. Its last reply was empty; check that OUT\.md exists before relying on it\./);
+	assert.doesNotMatch(empty.split("\n")[0]!, /below/);
+	assert.match(msg(""), /Its last reply was empty/, "no result at all");
+	const said = msg(`${header}\n\nI stopped: permission was denied.\noutput: OUT.md\n`);
+	assert.match(said, /\. Its last reply is below; check that OUT\.md exists before relying on it\.\n\nmaybe done:[\s\S]*I stopped: permission was denied\./);
+	assert.match(msg("Just the reply, from final_path."), /Its last reply is below/);
+	const plain = buildWakeMessage([{ worker: w(201, "maybe_done"), kind: "maybe_done" }], new Map([["201", "Done, I think."]])).content;
+	assert.match(plain, /^\[routr\] worker 201 · task · codex went idle without running routr done\. Its last reply is below\.\n\nDone, I think\.$/);
 });

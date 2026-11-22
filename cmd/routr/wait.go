@@ -324,8 +324,21 @@ func (a *app) header(p registry.Paths, w registry.Worker) string {
 		}
 		return fmt.Sprintf("closed: %s's tab was closed before it finished. routr send %d … resumes it", w.Label(), w.ID)
 	case registry.MaybeDone:
-		return fmt.Sprintf("maybe done: %s went idle without running routr done; below is its last reply. "+
-			"routr send %d … to have it go on (or run routr done)", w.Label(), w.ID)
+		why, last := "", "below is its last reply"
+		if w.Unanswered != "" {
+			why = fmt.Sprintf(", after a question it asked went unanswered (dismissed or refused in its tab: %s)", w.Unanswered)
+		}
+		// the reply body shows: the latest follow-up's, else the final message
+		cur := p.Current(w)
+		reply := cur.Final
+		if cur.Turn > 0 {
+			reply = cur.Reply
+		}
+		if strings.TrimSpace(reply) == "" {
+			last = "its last reply was empty"
+		}
+		return fmt.Sprintf("maybe done: %s went idle without running routr done%s; %s. "+
+			"routr send %d … to have it go on (or run routr done)", w.Label(), why, last, w.ID)
 	}
 	return ""
 }

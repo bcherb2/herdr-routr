@@ -6,8 +6,8 @@
 //   start      → a new worker (id from 7): starting, then running for
 //                FAKE_ROUTR_RUN_SECS (default 20) while a Claude-format
 //                transcript grows, then done (verdict fail, REDTEAM.md).
-//                Like the CLI it says "routr: queued worker ID …" on stderr
-//                and records the caller's PI_SESSION_ID
+//                Like the CLI it says "routr: queued worker ID …; registry
+//                DIR" on stderr and records the caller's PI_SESSION_ID
 //   flow start → chain demo-N, for the steps view: plan, review (pass), a
 //                foreach implement step (worker + 3 copies, 2 at once), and
 //                merge at a gate, each step FAKE_ROUTR_RUN_SECS long
@@ -240,7 +240,7 @@ switch (cmd) {
 		};
 		list(s, now);
 		save(s);
-		console.error(`routr: queued worker ${id} ${role} · ${s.workers[id].harness} (${s.workers[id].harness} · ${s.workers[id].model})`);
+		console.error(`routr: queued worker ${id} ${role} · ${s.workers[id].harness} (${s.workers[id].harness} · ${s.workers[id].model}); registry ${dir}`);
 		console.log(json ? JSON.stringify(record(id, s.workers[id], now)) : String(id));
 		break;
 	}
@@ -256,7 +256,7 @@ switch (cmd) {
 		const add = (w) => {
 			const id = s.nextId++;
 			s.workers[id] = { ...base, brief: "", ...w };
-			console.error(`routr: queued worker ${id} ${w.step} · ${w.harness}`);
+			console.error(`routr: queued worker ${id} ${w.step} · ${w.harness}; registry ${dir}`);
 			return id;
 		};
 		add({ step: "plan", role: "plan", harness: "claude", model: "opus", effort: "high", output: "PLAN.md", verdict: "pass", startedAt: now });
@@ -370,7 +370,7 @@ switch (cmd) {
 			console.error(`routr main: main.context = "compact": use one of truncate, summarize, off`);
 			process.exit(1);
 		}
-		console.log(m || JSON.stringify({ context: "truncate", at: 150000, keep_turns: 3, keep_tokens: 40000, strip_reasoning: true }));
+		console.log(m || JSON.stringify({ context: "truncate", at: 150000, keep_turns: 3, keep_tokens: 40000, keep_head: true, head_tokens: 40000, strip_reasoning: true }));
 		break;
 	}
 	case "fallback": {
